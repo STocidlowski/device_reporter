@@ -1,292 +1,309 @@
-# ScaleReporter, a USB Scale Data Interface
+# Device Reporter (formerly ScaleReporter)
 
-This project interfaces with an electronic scale via USB and provides real-time weight updates through a web interface and an API.
+A small Rust service that reads clinic devices over USB serial and publishes their results over
+HTTP and WebSocket, so a weight (and soon a blood pressure, a height, a urinalysis, a hemoglobin)
+can flow into the chart without anyone retyping it.
 
-This project was designed for use with "Health o meter" scales (I have a 1100L) and supports serial communication over a 
-CP210x USB to UART Bridge. If this script is run in a Windows environment, a [driver](https://www.silabs.com/developer-tools/usb-to-uart-bridge-vcp-drivers) will be necessary. 
-See the [Health O Meter Connectivity page](https://www.homscales.com/connectivitysolutions/) for the protocols for your scale if different from written.
+It started life as a Python script for one scale. It is now a generic reporter with a driver per
+device. The first and only driver so far is the **Health o meter** large-platform scale
+(1100 / 2000 series, "L" and "E" serial versions) over its CP210x USB-to-UART option. Adding a
+device means writing one driver module; everything else (detection, hot-plug, the API, the page)
+is shared.
 
-## Compatibility:
-Potentially could work with the following models, although I only have the 1100L to test. See the PDF in the reference 
-folder to modify to the flavor of text your scale uses.
+## What it does
 
-498KL, 500KL, 2210KL-AM, 597KL, 599KL, 752KL, 600KL, 2595KL, 522, 524, 553, 
-1100, 1110, 2000, 2101, 2400, 2500, 2600, 2610, 2650, 2700, 2900, 3001, 3105
+- **Auto-detects devices.** Serial ports are scanned every few seconds and matched to drivers by
+  USB vendor/product ID. Unplug and replug at will.
+- **One event per result, not one per packet.** The scale streams the same locked weight every
+  second while someone stands on it. The driver coalesces that into a single `observation` when
+  they step off. A different weight (a child hopping on after a parent) starts a new one.
+- **Plausibility flags for the clinician.** `below_minimum` for a bag or a foot on the platform,
+  `single_packet` when the scale only re-displayed a previous weight (RECALL/UNITS button).
+- **FHIR-ready output.** Every result carries LOINC codes and UCUM units, so the EMR can build
+  `Observation` resources without device-specific knowledge.
+- **Live page**, REST API, and a WebSocket stream with reconnection and keep-alive pings.
+- **`list` and `sniff` subcommands** for reverse-engineering the next device's protocol.
+- **Single static binary**, cross-compiled for the Raspberry Pi Zero W. No Python, no venv, no driver
+  install on Linux.
 
-## HIPAA / Security:
+## HIPAA / Security
 
-This is a work in progress, and does not currently adequately protect health information. Information is transmitted in 
-unencrypted free text. Anyone with access to the server address can reveal the last weight measurement. 
+This is a work in progress and does not by itself protect health information. It serves plain
+HTTP on the address you bind it to, with no authentication. Results contain a weight, timestamps,
+and whatever ID was typed on the device keypad.
 
-To help mitigate this risk short of a rewrite, this project (see below) is currently running on a Raspberry Pi Zero W with 
-[Tailscale](https://tailscale.com/) installed, and the UFW firewall restricts access only from the TailScale network 
- to authorized client computer clients via ACLs. Extreme care must be used in order to avoid HIPAA violations.
-
-You have been warned, this project and/or any contributors are not responsibility for any legal repercussions for 
-deploying it, etc. etc.
+Mitigations used here: bind to loopback and put nginx in front; run the Pi on
+[Tailscale](https://tailscale.com/) and let UFW admit only the tailnet (see below); keep logs at
+INFO, which never print device-entered IDs. Extreme care must be used in order to avoid HIPAA
+violations. You have been warned; this project and its contributors accept no responsibility for
+how it is deployed.
 
 ---
+## Transferring it to the Raspberry Pi:
+```wsl
+cd PycharmProject/ScaleReporter/target/pi/arm-unknown-linux-gnueabihf/release
+scp device-reporter shawn@bmpc-kent-scale:device-reporter
+```
 
-## Features
-
-- **Real-Time Weight Updates**: Displays weight data dynamically on a web interface.
-- **WebSocket Support**: Provides real-time updates to connected clients.
-- **REST API**: Serves the latest weight data as JSON.
-- **Cross-Platform**: Works on Linux, macOS, and Windows (requires CP210x driver on Windows).
-- **Easy-to-Use**: Includes a simple HTML interface for local testing.
-
----
-
-## How It Works
-
-1. **Data Parsing**:
-   - The scale sends data packets over USB.
-   - The program parses these packets to extract weight, height, BMI, and patient ID.
-
-2. **Web Interface**:
-   - A local web server on port `8080` displays weight data dynamically.
-   - Real-time updates are sent to the webpage via WebSocket.
-
-3. **API**:
-   - A REST API endpoint (`/api`) serves the latest weight data in JSON format.
-
-4. **WebSocket Endpoint**:
-   - Clients can connect to `/ws` to receive live weight updates.
-
-# General Usage
-
-Start the Server:
+**Caveat when updating:** Linux will not overwrite a binary that is running (`scp: dest open
+"device-reporter": Failure`, "text file busy"). Stop the service first, copy, then start it again:
 
 ```bash
-python main.py
+ssh shawn@bmpc-kent-scale sudo systemctl stop device-reporter
+scp device-reporter shawn@bmpc-kent-scale:device-reporter
+ssh shawn@bmpc-kent-scale sudo systemctl start device-reporter
 ```
 
-Access the Web Interface:
-- Open your browser and navigate to http://localhost:8080/. The scale reports the data once you step off the scale.
+## Running it
 
-![Scale Label](./reference/Scale_web.gif)
-
-Access the API:
-- Send a GET request to http://localhost:8080/api to fetch the latest weight data in JSON format.
-
-Connect via WebSocket:
-- Connect to ws://localhost:8080/ws to receive live updates.
-
-# File Structure
-```
-├── main.py            # Main application file
-├── html/
-│   └── static/
-│       └── index.html # Frontend HTML with JavaScript for WebSocket integration
-├── requirements.txt   # Python dependencies
-├── README.md          # Project documentation
+```bash
+cargo run --release                    # serve on 127.0.0.1:8080, auto-detect devices
+cargo run --release -- --demo          # no hardware: a simulated scale weighs a visitor every 15 s
+cargo run --release -- list            # serial ports with VID:PID, serial number, product
+cargo run --release -- sniff COM5      # hex + text dump of whatever COM5 sends
 ```
 
-# Contributing
+Open http://localhost:8080/ and step on the scale.
 
-Contributions are welcome! Feel free to submit a pull request or file an issue.
+Every flag has an environment variable (`DR_*`); run `device-reporter --help`. The ones you will
+actually use:
 
-# License
+| Flag | Env | Default | Purpose |
+|---|---|---|---|
+| `--bind` | `DR_BIND` | `127.0.0.1:8080` | Listen address. Use `0.0.0.0:8080` to reach it from another machine without nginx. |
+| `--assign PORT=DRIVER` | `DR_ASSIGN` | | Force a driver onto a port, e.g. `/dev/scale=healthometer_scale`. |
+| `--fallback-driver` | `DR_FALLBACK_DRIVER` | | Driver for `/dev/ttyUSB*` or `/dev/ttyACM*` ports that expose no USB descriptors. Normally unnecessary; the CP210x is recognised by VID:PID. |
+| `--cors-origin` | `DR_CORS_ORIGIN` | | Browser origins allowed to call the API cross-origin; needed for the WASM build of the EMR client. |
+| `--host` | `DR_HOST` | hostname | Name reported as `host` and used in device IDs. |
+| `--scale-quiet-ms` | `DR_SCALE_QUIET_MS` | `2500` | Silence that ends a weigh-in. |
+| `--scale-min-weight-kg` | `DR_SCALE_MIN_WEIGHT_KG` | `1` | Below this the result is flagged `below_minimum`. |
 
-This project is licensed under the MIT License. You are free to use, modify, and distribute this software, provided that proper attribution is given.
+On Windows the scale needs the Silicon Labs
+[CP210x driver](https://www.silabs.com/developer-tools/usb-to-uart-bridge-vcp-drivers). Linux has
+it built in.
 
-# Acknowledgments
+## API
 
-- FastAPI for the web framework. Love it. 
-- Pydantic for data validation and parsing.
-- Health o meter Scales (Sunbeam) for their hardware working well for 10+ years, and for publishing of their protocol publicly.
+| Route | Returns |
+|---|---|
+| `GET /` | The status page. |
+| `GET /api/status` | Process info plus every device seen since start. |
+| `GET /api/devices` | Just the device list. |
+| `GET /api/latest[?device=ID]` | Most recent observation, optionally from one device. 404 until there is one. |
+| `GET /api/observations[?device=ID&limit=N]` | Recent observations, newest first. |
+| `GET /ws` | Live event stream (below). |
+
+### Events
+
+Every WebSocket message is JSON with `v` (wire version, currently `1`) and `type`. On connect you
+get a `server` snapshot and the latest `observation` from each device, then live events.
+
+```jsonc
+// server: sent once on connect
+{"v":1,"type":"server","host":"scale-pi","version":"0.2.0","started_at":"…","devices":[…]}
+
+// device: a device connected, disconnected, or started/stopped measuring
+{"v":1,"type":"device","id":"scale-pi-dev-ttyUSB0","kind":"healthometer_scale",
+ "display_name":"Health o meter scale","port":"/dev/ttyUSB0","connected":true,
+ "last_error":null,"last_data_at":"…","active":true}
+
+// reading: provisional, once per second while someone is on the scale
+{"v":1,"type":"reading","device_id":"…","device_kind":"healthometer_scale","at":"…",
+ "subject_hint":null,"components":[{"code":"29463-7","display":"Body weight","value":184.5,"unit":"[lb_av]"}]}
+
+// observation: one completed result
+{"v":1,"type":"observation","id":"d094ff0f-…","device_id":"…","device_kind":"healthometer_scale",
+ "captured_at":"…","completed_at":"…","subject_hint":null,
+ "components":[
+   {"code":"29463-7","display":"Body weight","value":72.4,"unit":"kg"},
+   {"code":"8302-2","display":"Body height","value":178.0,"unit":"cm"},
+   {"code":"39156-5","display":"Body mass index","value":22.9,"unit":"kg/m2"}],
+ "flags":[],"packets":5}
+```
+
+`components[].code` is LOINC; `unit` is UCUM (`kg`, `[lb_av]`, `cm`, `[in_i]`, `kg/m2`, later
+`mm[Hg]`, `g/dL`, …). `value` is a number or, for coded results such as a urinalysis "trace", a
+string. `subject_hint` is whatever ID the device itself carried (the scale keypad); it is a hint
+for the clinician, never an identity. `id` is random per observation so the EMR can accept or
+discard exactly one.
+
+## How the scale driver works
+
+The protocol (see `reference/HealthometerProf.CommunicationProtocols*.pdf`) is 9600 8N1 and each
+packet looks like this, with no newline:
+
+```text
+<ESC>R<ESC>I1234567890<ESC>W184.5<ESC>H84.0<ESC>B24.1<ESC>T0.0<ESC>Nm<ESC>E
+```
+
+`src/drivers/healthometer/protocol.rs` frames on the `<ESC>E` terminator, anchors on the last `R`
+field so a fragment from connecting mid-stream can never be glued onto the next packet and misread
+as its weight, and refuses packets with no weight or no units. `session.rs` turns the once-per-second
+stream into one result. Both are pure and unit-tested against the packets printed in the PDF.
+
+## Adding a device
+
+1. Find it: `device-reporter list` shows VID:PID and product strings.
+2. Learn its protocol: `device-reporter sniff COM7 --baud 9600` (and `--parity`, `--data-bits`,
+   `--send-hex "1b 52"` for devices that need a request). `--capture file.bin` saves the raw bytes
+   for a unit test.
+3. Create `src/drivers/<device>/mod.rs` implementing `Driver` (how to recognise the port and its
+   line settings) and `DeviceSession` (bytes in, `Output::Live` / `Output::Complete` out). Look at
+   the healthometer driver.
+4. Register it in `driver::registry`.
+
+Devices queued up: urinalysis strip reader, automatic blood-pressure cuff, Detecto sonar
+stadiometer, hemoglobin meter.
+
+## Project layout
+
+```
+├── Cargo.toml
+├── src/
+│   ├── main.rs        CLI (serve / list / sniff), wiring
+│   ├── model.rs       Observation, Component, DeviceStatus, Event: the JSON contract
+│   ├── driver.rs      Driver and DeviceSession traits, port matching, registry
+│   ├── drivers/
+│   │   └── healthometer/   protocol.rs (framing, parsing), session.rs (coalescing), mod.rs (driver)
+│   ├── manager.rs     port scanning, driver pairing, hot-plug, one thread per device
+│   ├── serial.rs      the blocking connection loop shared by every serial driver
+│   ├── state.rs       shared state and the broadcast channel
+│   ├── web.rs         axum routes and the WebSocket
+│   ├── sniff.rs       `list` and `sniff`
+│   └── demo.rs        a fake scale for `--demo`
+├── static/index.html  the status page, embedded in the binary
+└── reference/         the manufacturer protocol PDF, wiring photos, screenshots
+```
+
+`cargo test` runs 45 unit tests, none of which need hardware. `cargo clippy --all-targets` is
+clean under the strict lint set in `Cargo.toml` (no `unwrap`, `expect`, `panic` or indexing in
+non-test code).
 
 ---
 
-# Project Documentation
+# Raspberry Pi deployment
 
-**Background**: I am a Family Physician and love tinkering, programming, teaching and learning. I like when my hobbies can
-intersect with my profession as well. Maybe this will get used, who knows. It could potentially be adapted to report to 
-an EMR I suppose, or maybe just used by a MA who keeps forgetting to write/remember the weight when they weigh a patient. 
+**Background**: I am a Family Physician and love tinkering, programming, teaching and learning. I
+like when my hobbies can intersect with my profession as well. This is the permanently installed
+Raspberry Pi that lives behind the scale, documented so I can rebuild it if it is ever lost, and
+so anyone else can try it.
 
-**Audience**: My target audience for this writeup is writing at a level for someone who knows what a terminal is, but may not be overly 
-familiar with linux. They know how to get here, but not sure if there is a .exe to download. There is not, this is python mainly.
+**Audience**: someone who knows what a terminal is but may not be overly familiar with Linux.
 
-**Purpose**: The following is documentation for use of a permanently installed Raspberry Pi in a headless configuration for the scale. 
-This is intended to document the project as well as serve as a tutorial for anyone interested in trying it themselves. 
-I will also likely need this guide if I need to troubleshoot or re-create it from scratch if/when it is stolen/lost/destroyed.
+Consider trying the project from your laptop first (`cargo run --release -- --bind 0.0.0.0:8080`)
+to see that your scale is compatible before buying anything.
 
-Consider trying the project from your laptop first to see if your scale is compatible and working.
+## Parts list
 
-Spoilers: It works great for me. I liked this project and a fun way to kill a few hours for a few free days.
+- [ ] Raspberry Pi Zero W (32-bit, ARMv6), which I use, or a
+  [Raspberry Pi Zero 2 W](https://www.adafruit.com/product/5291) (~$15). Any Pi works; this is a
+  stupidly low load, and the Zero draws
+  [only about 0.6-1.2 W](http://raspi.tv/2017/how-much-power-does-pi-zero-w-use).
+- [ ] Case for the Pi. I 3D printed one.
+- [ ] Micro-USB cable for power, or a
+  [USB power-only cable with switch](https://www.adafruit.com/product/2379).
+- [ ] MicroSD card, at least 1 GB.
+- [ ] Micro-USB to USB-B cable. Hard to find; I bought
+  [these on Amazon](https://www.amazon.com/Printer-Traovien-Android-Scanner-Electronic/dp/B099N1PWW6).
+  A USB Mini-to-A adapter also works, or use a full-size Pi.
+- [ ] A scale with the connectivity option. Hopefully you have this already if you are reading this.
 
-## Parts List:
-- [ ] Raspberry Pi Zero (32 bit only), which I am using, or [Raspberry Pi Zero 2 W](https://www.adafruit.com/product/5291) - $15.00. Really any computer or Pi will work. This is stupidly low load/requirement for any computer, and the Zero draws [only about 0.6-1.2W](http://raspi.tv/2017/how-much-power-does-pi-zero-w-use), which is ideal for this.
-- [ ] Case for the Pi - I 3d printed one.
-- [ ] USB-Micro cable for power - Use an old one, or consider [USB Power Only Cable with Switch](https://www.adafruit.com/product/2379) - $5.95
-- [ ] MicroSD Card - at least 1GB
-- [ ] USB-Micro to USB-B - Hard to find, but I bought one on [Amazon](https://www.amazon.com/Printer-Traovien-Android-Scanner-Electronic/dp/B099N1PWW6) for $10 for 2.
-You can alternatively use a USB Mini to A adapter which I used temporarily, or just use a full size PI if you have one instead.
-- [ ] Scale with connectivity, hopefully you have this already if you are seeing this.
+![Scale label](./reference/label.jpg)
 
-![Scale Label](./reference/label.jpg)
+## Image the Pi (headless)
 
+### Generate an SSH key pair
 
-## Initial Setup & Installation:
-
-We will install the OS by writing to a micro-sd card directly, and set it up "headless", so we never have to use a monitor.
-
-For this script, modify this section based on whichever operating system you are using.
-
-### Generate an SSH Key pair.
-You should set up SSH key before we image, so we can disallow any password logins and improve security for SSH.
-
-I am doing this project from Windows, so I am using [PuTTY](https://www.chiark.greenend.org.uk/~sgtatham/putty/) 
-as a SSH client. You can generate the SSH Key in PuTTY-Gen, which is also included in the download. 
-Save the key safely/securely, use it in PuTTY to log in automatically. 
+Set up an SSH key before imaging so password logins can be disabled. On Windows I use
+[PuTTY](https://www.chiark.greenend.org.uk/~sgtatham/putty/); PuTTYgen, included in the download,
+generates the key. Save it somewhere safe; you will paste the public key into the imager next.
 
 ![PuTTYgen](./reference/PuTTYgen.png)
 
-We will soon paste the public key into the Raspberry Pi Imager.
+### Write Raspberry Pi OS
 
-### Image Raspberry Pi OS (Raspbian):
-Install Raspberry Pi OS using [Raspberry Pi Imager](https://www.raspberrypi.com/software/) on to your SD card. This is 
-easier than using the older method of using [balenaEtcher](https://etcher.balena.io/) for the raspberry pi ISO.
+Install Raspberry Pi OS (Lite is fine) with
+[Raspberry Pi Imager](https://www.raspberrypi.com/software/). In the settings, choose a hostname
+(I use `scale-pi`), enter the Wi-Fi password, enable SSH, and paste the public key.
 
 ![Raspberry Pi Imager](./reference/Raspberry%20Pi%20Imager.png)
 
-Make sure that you input the Wi-Fi password, and paste the public key you generated in the last step.
+### Save the PuTTY session
 
-This will take a few minutes, so in the meanwhile, let's set up the SSH client PuTTY:
+- Host name: `scale-pi.local`
+- Connection → SSH → Auth → Credentials: your `.ppk` file
+- Connection → Data: your username
+- Session: give it a name and Save
 
-### Save PuTTY configuration.
-- Open up PuTTY 
-- Type the address you chose "{name}.local" as the host name.
-- On the left, open the tab: Connection->SSH->Auth->Credentials
-- Select the key file you saved as *.ppk (PuTTY key format)
-- On the left, open the tab: Connection->Data
-- Type the username you had chosen
-- On the left, open the first tab "Session" type a name for this config then click "Save" 
+### First boot and login
 
-### Start the system
-When the imager is finished, pop in the micro-sd card into the Pi and power the system up.
+Pop the card in, power up, wait a minute, open the saved PuTTY session, accept the host key.
 
-If everything is working as intended and the WiFi password is correct, you will see the device on your router's LAN list
-
-### SSH into the running system
-Go back to PuTTY and click your Saved Session configuration, click load, then "Open" on the bottom right.
-
-Click "Accept" on the warning to trust the PI on first access of SSH
 ![PuTTY alert](./reference/PuTTY_alert.png)
 
-Hint: right-clicking the terminal will paste into the SSH console. Try this with the following section.
+Hint: right-clicking the terminal pastes.
 
-## Setting up the Raspberry Pi software
-
-As with any new install, update everything
-```bash
-sudo apt update
-```
+Update everything, then reboot:
 
 ```bash
-sudo apt upgrade -y
-```
-
-Change some settings here, like expanding the filesystem:
-```bash
-sudo raspi-config
-```
-
-Restart the system, then reconnect with your SSH client after about 60 seconds.
-```bash
+sudo apt update && sudo apt upgrade -y
+sudo raspi-config  # expand filesystem, set logging to volatile
 sudo shutdown -r now
 ```
 
-### Install GIT & Download Repository
-Install git, otherwise you will need to just copy player.py directly and create a 'videos' folder
+## Build the binary for the Pi
+
+Cross-compile on your PC; the Pi Zero would take an age to compile Rust. From WSL (Ubuntu), with
+[Rust](https://rustup.rs), [zig](https://ziglang.org/download/) and `cargo install cargo-zigbuild`:
+
 ```bash
-sudo apt install git -y
+cd /mnt/c/Users/<you>/PycharmProject/ScaleReporter
+rustup target add arm-unknown-linux-gnueabihf          # Pi Zero W / Zero (ARMv6)
+CARGO_TARGET_DIR=target/pi cargo zigbuild --release --target arm-unknown-linux-gnueabihf.2.31
 ```
 
-Install this repository in the folder of your choosing, or in "Home (~/)" aka the default directory if you don't plan on 
-making another user run it. That would probably be better, but this is easier.
+The `.2.31` pins glibc 2.31 (Raspberry Pi OS Bullseye), which also runs on Bookworm (2.36). For a
+Zero 2 W, Pi 3/4/5 running 64-bit OS use `aarch64-unknown-linux-gnu` instead. The binary is at
+`target/pi/arm-unknown-linux-gnueabihf/release/device-reporter`, about 2 MB, no dependencies beyond glibc.
+(`CARGO_TARGET_DIR=target/pi` keeps the WSL build out of the Windows `target/` directory.)
+
+Copy it over with `scp` as shown in *Transferring it to the Raspberry Pi* above.
+
+## Plug in and test
+
+Plug the scale into the Pi (the Zero's *inner* micro-USB port is data; the outer one is power only)
+and run the binary:
+
 ```bash
-git clone https://github.com/STocidlowski/ScaleReporter
+~/device-reporter --bind 0.0.0.0:8080
 ```
 
-### Make a venv and install requirements
-Make a "venv", a Virtual Environment, then install the requirements to this environment.
+Within a few seconds the log shows `opening device ... port=/dev/ttyUSB0 driver=healthometer_scale`.
+The CP210x bridge is recognized by its USB vendor/product ID, so no port name or driver flag is
+needed, and the default Raspberry Pi OS user is already in the `dialout` group. If a port ever
+shows up as "no matching driver", `~/device-reporter list` shows what the OS knows about it and
+`--assign /dev/ttyUSB0=healthometer_scale` forces the pairing.
+
+Browse to http://<hostname>.local:8080/, step on the scale, Ctrl-C when happy.
+
+## Run it as a service
+
 ```bash
-cd ScaleReporter
-python3 -m venv ScaleReporter
-source ScaleReporter/bin/activate
-pip install -r requirements.txt
-```
-### Testing
-Run it!
-```bash
-python3 ~/ScaleReporter/main.py
-```
-
-Try it out, see if it works. it will serve on :8080 by default.
-
-Paste the name of your pi into your browser. for example: `scale-pi.local:8080` 
-
-It should host a HTML page. If it does, we have success and we can plug in the scale and continue.
-
-- Use `ctr-c` to stop the program
-
-- When you're finished working in the virtual environment, run:
-```bash
-deactivate
+sudo nano /etc/systemd/system/device-reporter.service
 ```
 
-Turn it off, signal shutdown
-```bash
-sudo shutdown -h now
-```
-
-Turn it off / unplug it after maybe 20 seconds. Relocate the pi to the scale and plug it in. 
-
----
-
-Now that it is plugged into the scale, let's make sure we can see it the scale as an interface.
-
-### USB serial permissions
-
-List the USB devices connected. The scale only was here when I switched the USB ports. The Pi Zero does list one as for Power. Whoops.
-```bash
-sudo lsusb
-```
-You will hopefully find something similar to the following: `Bus 001 Device 002: ID 10c4:ea60 Silicon Labs CP210x UART Bridge`
-
-Check the group ownership of the serial port. `ttyUSB0` will likely be it if there are no other plugged in USB devices.
-```bash
-ls -l /dev/ttyUSB0
-```
-
-It should show serial port belongs to the `dialout` group
-
-Add the user to the `dialout` group
-```bash
-sudo usermod -aG dialout shawn
-```
-
-## Set up an automatic service to start the program
-
-Setup the ScaleReporter service:
-```bash
-sudo nano /etc/systemd/system/ScaleReporter.service
-```
-
-Paste the following into the editor, fixing the directory name if it is different and save:
 ```systemd
 [Unit]
-Description=ScaleReporter
+Description=Device Reporter (clinic USB devices)
 After=network.target
 
 [Service]
-WorkingDirectory=/home/shawn/ScaleReporter/
-ExecStart=/home/shawn/ScaleReporter/ScaleReporter/bin/python /home/shawn/ScaleReporter/main.py
+ExecStart=/home/shawn/device-reporter
+WorkingDirectory=/home/shawn
+Environment=DR_BIND=127.0.0.1:8080
+Environment=RUST_LOG=info
 Restart=always
-Environment=PYTHONUNBUFFERED=1
-StandardOutput=journal
-StandardError=journal
+RestartSec=3
 User=shawn
 Group=dialout
 
@@ -295,194 +312,117 @@ WantedBy=multi-user.target
 ```
 
 ```bash
-sudo systemctl enable ScaleReporter.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now device-reporter.service
+journalctl -u device-reporter.service -f      # follow the logs
 ```
 
-Reload the daemon if you make any changes
-```bash
-systemctl daemon-reload
-```
+To upgrade: `sudo systemctl stop device-reporter`, `scp` the new binary over, then
+`sudo systemctl start device-reporter`. Copying while the service runs fails with "text file
+busy" because Linux will not overwrite an executable that is in use.
 
-Check the logs to see if everything went right:
-```bash
-journalctl -u ScaleReporter.service
-```
+`DR_BIND=127.0.0.1` means only nginx on the Pi can reach it, which is what you want once the next
+section is done. For testing without nginx, use `0.0.0.0:8080`.
 
-Follow the logs in real-time with "-f"
-```bash
-journalctl -u ScaleReporter.service -f
-```
-
-## Final Test:
-
-Restart and see if you can log in from your browser.
-```bash
-sudo shutdown -r now
-```
-
-
-## Optional Basic Security improvements
-This project should include better security, but here is a very basic setup
+## Optional basic security improvements
 
 ### Tailscale
-I installed [Tailscale](https://tailscale.com), because "it just works." and will encrypt data using the open 
-source [WireGuard](https://www.wireguard.com/) as well as easy access control. Useful if you want to SSH from any connected authorized device, even if not on local LAN.
-Use the Tailscale admin page to add a Linux server, and will automatically generate an installation script.
+
+I installed [Tailscale](https://tailscale.com) because it just works. It encrypts everything with
+[WireGuard](https://www.wireguard.com/) and gives easy access control: any device on the tailnet
+can reach the Pi from anywhere; nothing else can. The Tailscale admin page generates the install
+command:
+
 ```bash
 curl -fsSL https://tailscale.com/install.sh | sh && sudo tailscale up --auth-key=tskey-auth-.....
-```
-Automatically update, if desired. I do desire that.
-```bash
 sudo tailscale set --auto-update
 ```
 
-You can now access the scale from anywhere, as long as the device is on the Tailnet. 
+### nginx
 
-### NGINX
-Forward traffic from :80 and :443 to our :8080 we are hosting using NGINX. This can be used to enable SSL in the future.
+Forward :80 to the service so no port is needed in the URL, and so TLS can be added later.
 
 ```bash
 sudo apt install nginx -y
-```
-
-edit the sites:
-Delete the symlink to the default, the original will remain in sites-available:
-```bash
 sudo rm /etc/nginx/sites-enabled/default
+sudo nano /etc/nginx/sites-available/device-reporter
 ```
 
-Add the new available site:
-```bash
-sudo nano /etc/nginx/sites-available/pi-scale
-```
-
-Paste the following:
 ```nginx
 server {
     listen 80;
-    server_name scale-pi;
+    server_name _;
 
     location / {
-        proxy_pass http://localhost:8080;  # Forward to FastAPI app
+        proxy_pass http://127.0.0.1:8080;
         proxy_set_header Host $host;
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto $scheme;
 
-        # WebSocket headers
+        # WebSocket
         proxy_http_version 1.1;
         proxy_set_header Upgrade $http_upgrade;
         proxy_set_header Connection "upgrade";
+        # The service pings every 20 s; this is just belt and braces for quiet nights.
+        proxy_read_timeout 1h;
     }
 }
-
-server {
-    listen 443;
-    server_name scale-pi;
-
-    # Uncomment these lines and configure SSL certificates when ready
-    # ssl_certificate /etc/letsencrypt/live/pi-scale/fullchain.pem;
-    # ssl_certificate_key /etc/letsencrypt/live/pi-scale/privkey.pem;
-
-    location / {
-        proxy_pass http://localhost:8080;  # Forward to FastAPI app
-        proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto $scheme;
-
-        # WebSocket headers
-        proxy_http_version 1.1;
-        proxy_set_header Upgrade $http_upgrade;
-        proxy_set_header Connection "upgrade";
-    }
-}
-
 ```
 
-Create a symbolic link to enable the site:
 ```bash
-sudo ln -s /etc/nginx/sites-available/pi-scale /etc/nginx/sites-enabled/
+sudo ln -s /etc/nginx/sites-available/device-reporter /etc/nginx/sites-enabled/
+sudo nginx -t && sudo systemctl reload nginx
 ```
 
-Test for syntax errors:
-```bash
-sudo nginx -t
-```
+Now http://scale-pi/ works from any tailnet device.
 
-Reload Nginx to apply changes:
-```bash
-sudo systemctl reload nginx
-```
+### UFW firewall
 
-We should now be able to access this from tailscale without specifying a port: http://scale-pi/
+Admit SSH and HTTP only over Tailscale:
 
-### UFW - Firewall
-Now, lets only allow the tailnet to access this machine. I will also allow local SSH, just in case tailscale fails for some reason.
-
-Install UFW
 ```bash
 sudo apt install ufw -y
-```
-
-Only allow port 22 inbound on lan (192.168.1.) or on the Tailscale network (100.)
-
-Only allow http(s) inbound from the Tailscale network (100.):
-```bash
 sudo ufw default deny incoming
 sudo ufw default allow outgoing
-sudo ufw allow from 192.168.1.0/24 to any port 22
 sudo ufw allow in on tailscale0 to any port 22
 sudo ufw allow in on tailscale0 to any port 80
 sudo ufw allow in on tailscale0 to any port 443
-```
-
-Allowing connections to UDP port 41641 may help Tailscale make a peer-to-peer connection without a relay
-```bash
-sudo ufw allow 41641/udp
-```
-
-Review the UFW rules to ensure they are set correctly:
-```bash
+sudo ufw allow 41641/udp           # helps Tailscale connect peer-to-peer
 sudo ufw status numbered
-```
-
-```text
-     To                         Action      From
-     --                         ------      ----
-[ 1] 22                         ALLOW IN    192.168.1.0/24
-[ 2] 41641/udp                  ALLOW IN    Anywhere
-[ 3] 22 on tailscale0           ALLOW IN    Anywhere
-[ 4] 80 on tailscale0           ALLOW IN    Anywhere
-[ 5] 443 on tailscale0          ALLOW IN    Anywhere
-[ 6] 41641/udp (v6)             ALLOW IN    Anywhere (v6)
-[ 7] 22 (v6) on tailscale0      ALLOW IN    Anywhere (v6)
-[ 8] 80 (v6) on tailscale0      ALLOW IN    Anywhere (v6)
-[ 9] 443 (v6) on tailscale0     ALLOW IN    Anywhere (v6)
-```
-
-
-Enable UFW and restart ssh:
-```bash
 sudo ufw enable
 sudo service ssh restart
 ```
 
-Or restart ufw and ssh
-```bash
-sudo ufw reload
-sudo service ssh restart
-```
-
-### Ultimate test:
-- Try logging in and/or  using the site - should work
-- Quit the Tailscale client on your local machine, then try using the site or logging in again - should fail.
-
-
-That's it, we are only allowing us to access our server from an authorized device, and have "zero trust" implementation
-
-Hope your project went as well as mine.
-
-- ST
+Ultimate test: the page and SSH work with Tailscale running on your PC and fail with it quit.
+That is a zero-trust setup: only authorized devices can reach the Pi at all.
 
 ---
+
+## Next: into the chart
+
+The plan is for the EMR client (front_desk, an egui app that already speaks WebSocket) to
+subscribe to `/ws`, and when an `observation` arrives while a chart is open, show it as a
+**pending** vital: "Weight 184.5 lb from the Room 2 scale, 12 s ago. Accept into this chart?" The
+clinician confirms it is the right person (not their kid playing on the scale) and the client
+writes a FHIR `Observation` with device provenance. Nothing is charted automatically.
+
+Longer term the Pi should post observations to the FHIR server instead, which gives a device
+registry, room-to-device mapping, an audit trail, and a pending queue that survives client
+restarts.
+
+## Contributing
+
+Contributions are welcome. Add a driver for your device; a raw capture from `sniff --capture`
+makes a great unit test fixture.
+
+## License
+
+MIT. You are free to use, modify, and distribute this software, provided that proper attribution is
+given.
+
+## Acknowledgments
+
+- Health o meter (Pelstar) for hardware that has worked for 10+ years and for publishing their
+  serial protocol.
+- The `serialport`, `axum`, `tokio` and `jiff` crates.

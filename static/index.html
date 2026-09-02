@@ -1,0 +1,218 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Device Reporter</title>
+<style>
+  :root { --fg: #222; --muted: #666; --bg: #fff; --card: #f6f7f9; --line: #dfe3e8; --accent: #0b6bcb; --ok: #1a8f3a; --bad: #c62828; --warn: #b26a00; }
+  body { font-family: system-ui, -apple-system, "Segoe UI", Roboto, Arial, sans-serif; color: var(--fg); background: var(--bg); margin: 0; padding: 16px; max-width: 900px; margin-inline: auto; }
+  h1 { font-size: 1.25rem; margin: 0 0 4px; }
+  h2 { font-size: 0.95rem; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; margin: 20px 0 8px; }
+  .muted { color: var(--muted); }
+  #conn { font-size: .9rem; }
+  .dot { display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 6px; background: var(--bad); vertical-align: middle; }
+  .dot.ok { background: var(--ok); }
+  .dot.active { background: var(--accent); box-shadow: 0 0 0 4px rgba(11,107,203,.2); }
+  .cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 10px; }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 8px; padding: 12px; }
+  .card .name { font-weight: 600; }
+  .card .detail { font-size: .85rem; color: var(--muted); margin-top: 4px; }
+  #latest { border-color: var(--accent); }
+  #latest .big { font-size: 3rem; font-weight: 700; color: var(--accent); line-height: 1.1; margin: 4px 0; }
+  #latest .comp { font-size: 1rem; margin: 2px 0; }
+  .flag { display: inline-block; font-size: .75rem; padding: 2px 8px; border-radius: 12px; background: #fff3e0; color: var(--warn); border: 1px solid #ffd699; margin-right: 6px; }
+  button { font: inherit; padding: 8px 14px; border: none; border-radius: 6px; background: var(--ok); color: #fff; cursor: pointer; margin-top: 10px; }
+  button:hover { filter: brightness(.95); }
+  button:active { transform: scale(.98); }
+  table { width: 100%; border-collapse: collapse; font-size: .9rem; }
+  th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  th { color: var(--muted); font-weight: 600; }
+  #live { font-size: .95rem; }
+  .hidden { display: none; }
+</style>
+</head>
+<body>
+  <h1>Device Reporter</h1>
+  <div id="conn"><span class="dot" id="conn-dot"></span><span id="conn-text">Connecting…</span></div>
+
+  <h2>Devices</h2>
+  <div id="devices" class="cards"><div class="muted">No devices seen yet.</div></div>
+
+  <h2>Live</h2>
+  <div id="live" class="muted">Nothing on any device right now.</div>
+
+  <h2>Latest result</h2>
+  <div id="latest" class="card hidden">
+    <div class="detail" id="latest-device"></div>
+    <div class="big" id="latest-big"></div>
+    <div id="latest-comps"></div>
+    <div class="detail" id="latest-when"></div>
+    <div class="detail" id="latest-hint"></div>
+    <div id="latest-flags"></div>
+    <button id="copy">Copy value</button>
+  </div>
+  <div id="no-latest" class="muted">No results yet.</div>
+
+  <h2>Recent results</h2>
+  <table>
+    <thead><tr><th>When</th><th>Device</th><th>Result</th><th>Flags</th></tr></thead>
+    <tbody id="history"></tbody>
+  </table>
+
+<script>
+(function () {
+  "use strict";
+  const UNIT_LABELS = { "kg": "kg", "[lb_av]": "lb", "cm": "cm", "[in_i]": "in", "kg/m2": "kg/m²", "mm[Hg]": "mmHg", "/min": "bpm", "g/dL": "g/dL" };
+  const $ = (id) => document.getElementById(id);
+  const devices = new Map();     // id -> device status
+  const liveByDevice = new Map(); // id -> reading
+  let latest = null;
+  const history = [];
+  const HISTORY_MAX = 25;
+
+  function unit(u) { return u ? (UNIT_LABELS[u] || u) : ""; }
+  function fmtValue(c) {
+    if (typeof c.value === "number") return `${c.value} ${unit(c.unit)}`.trim();
+    return String(c.value);
+  }
+  function timeSince(ts) {
+    const s = Math.floor((Date.now() - new Date(ts).getTime()) / 1000);
+    if (s < 5) return "now";
+    if (s < 60) return `${s}s ago`;
+    if (s < 3600) return `${Math.floor(s / 60)}m ago`;
+    if (s < 86400) return `${Math.floor(s / 3600)}h ago`;
+    return `${Math.floor(s / 86400)}d ago`;
+  }
+  function el(tag, cls, text) {
+    const e = document.createElement(tag);
+    if (cls) e.className = cls;
+    if (text !== undefined) e.textContent = text;
+    return e;
+  }
+  function deviceName(id) {
+    const d = devices.get(id);
+    return d ? d.display_name : id;
+  }
+
+  function renderDevices() {
+    const root = $("devices");
+    root.replaceChildren();
+    if (devices.size === 0) { root.append(el("div", "muted", "No devices seen yet.")); return; }
+    for (const d of devices.values()) {
+      const card = el("div", "card");
+      const name = el("div", "name");
+      const dot = el("span", "dot" + (d.connected ? (d.active ? " ok active" : " ok") : ""));
+      name.append(dot, document.createTextNode(d.display_name));
+      card.append(name);
+      const state = d.connected ? (d.active ? "measuring" : "connected") : ("disconnected" + (d.last_error ? ` (${d.last_error})` : ""));
+      card.append(el("div", "detail", `${state} · ${d.port} · ${d.id}`));
+      if (d.last_data_at) card.append(el("div", "detail", `last data ${timeSince(d.last_data_at)}`));
+      root.append(card);
+    }
+  }
+
+  function renderLive() {
+    const root = $("live");
+    root.replaceChildren();
+    const active = [...liveByDevice.values()].filter(r => Date.now() - new Date(r.at).getTime() < 4000);
+    if (active.length === 0) { root.className = "muted"; root.textContent = "Nothing on any device right now."; return; }
+    root.className = "";
+    for (const r of active) {
+      const line = el("div");
+      line.append(el("b", null, deviceName(r.device_id) + ": "));
+      line.append(document.createTextNode(r.components.map(fmtValue).join("  ·  ")));
+      root.append(line);
+    }
+  }
+
+  function renderLatest() {
+    if (!latest) { $("latest").classList.add("hidden"); $("no-latest").classList.remove("hidden"); return; }
+    $("latest").classList.remove("hidden"); $("no-latest").classList.add("hidden");
+    $("latest-device").textContent = `${deviceName(latest.device_id)} · ${latest.device_id}`;
+    const [first, ...rest] = latest.components;
+    $("latest-big").textContent = first ? fmtValue(first) : "—";
+    const comps = $("latest-comps");
+    comps.replaceChildren();
+    for (const c of rest) comps.append(el("div", "comp", `${c.display}: ${fmtValue(c)}`));
+    $("latest-when").textContent = `${new Date(latest.captured_at).toLocaleString()} (${timeSince(latest.captured_at)}) · ${latest.packets} packet${latest.packets === 1 ? "" : "s"}`;
+    $("latest-hint").textContent = latest.subject_hint ? `Device-entered ID: ${latest.subject_hint}` : "";
+    const flags = $("latest-flags");
+    flags.replaceChildren();
+    for (const f of latest.flags) flags.append(el("span", "flag", f.replace(/_/g, " ")));
+  }
+
+  function renderHistory() {
+    const body = $("history");
+    body.replaceChildren();
+    for (const o of history) {
+      const tr = el("tr");
+      tr.append(el("td", null, new Date(o.captured_at).toLocaleTimeString()));
+      tr.append(el("td", null, deviceName(o.device_id)));
+      tr.append(el("td", null, o.components.map(c => `${c.display} ${fmtValue(c)}`).join(", ")));
+      tr.append(el("td", null, o.flags.map(f => f.replace(/_/g, " ")).join(", ")));
+      body.append(tr);
+    }
+  }
+
+  function handle(msg) {
+    switch (msg.type) {
+      case "server":
+        devices.clear();
+        for (const d of msg.devices) devices.set(d.id, d);
+        renderDevices();
+        break;
+      case "device":
+        devices.set(msg.id, msg);
+        renderDevices();
+        break;
+      case "reading":
+        liveByDevice.set(msg.device_id, msg);
+        renderLive();
+        break;
+      case "observation":
+        if (!latest || new Date(msg.completed_at) >= new Date(latest.completed_at)) latest = msg;
+        if (!history.some(o => o.id === msg.id)) {
+          history.unshift(msg);
+          history.length = Math.min(history.length, HISTORY_MAX);
+        }
+        renderLatest();
+        renderHistory();
+        break;
+      default:
+        break;
+    }
+  }
+
+  $("copy").addEventListener("click", () => {
+    if (!latest || !latest.components.length) return;
+    const text = fmtValue(latest.components[0]);
+    navigator.clipboard.writeText(text).then(
+      () => { $("copy").textContent = `Copied "${text}"`; setTimeout(() => { $("copy").textContent = "Copy value"; }, 1500); },
+      () => { $("copy").textContent = "Copy failed"; }
+    );
+  });
+
+  let retryMs = 1000;
+  function connect() {
+    const proto = location.protocol === "https:" ? "wss" : "ws";
+    const ws = new WebSocket(`${proto}://${location.host}/ws`);
+    ws.onopen = () => { retryMs = 1000; $("conn-dot").className = "dot ok"; $("conn-text").textContent = `Connected to ${location.host}`; };
+    ws.onmessage = (e) => { try { handle(JSON.parse(e.data)); } catch (err) { console.error("bad event", err); } };
+    ws.onerror = () => ws.close();
+    ws.onclose = () => {
+      $("conn-dot").className = "dot";
+      $("conn-text").textContent = `Disconnected from ${location.host}; retrying in ${Math.round(retryMs / 1000)}s`;
+      for (const d of devices.values()) d.connected = false;
+      renderDevices();
+      setTimeout(connect, retryMs);
+      retryMs = Math.min(retryMs * 2, 15000);
+    };
+  }
+
+  setInterval(() => { renderLive(); if (latest) renderLatest(); renderDevices(); }, 1000);
+  connect();
+})();
+</script>
+</body>
+</html>

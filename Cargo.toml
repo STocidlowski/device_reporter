@@ -1,0 +1,56 @@
+[package]
+name = "device_reporter"
+version = "0.2.0"
+edition = "2024"
+description = "Reads clinic devices (starting with the Health o meter scale) over USB serial and publishes their results over HTTP and WebSocket."
+license = "MIT"
+repository = "https://github.com/STocidlowski/ScaleReporter"
+publish = false
+
+[dependencies]
+axum = { version = "0.8", features = ["ws"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "signal"] }
+tower-http = { version = "0.7", features = ["cors"] }
+futures-util = { version = "0.3", default-features = false, features = ["sink"] }
+
+# `default-features = false` drops libudev so the Linux binary cross-compiles
+# with cargo-zigbuild and has no shared-library dependency on the Pi. The crate
+# still reads USB VID/PID/serial from sysfs on Linux, so detection works there
+# (verified on a Pi Zero W); `--fallback-driver` covers the rare port with no
+# descriptors at all.
+serialport = { version = "4.10", default-features = false }
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+jiff = { version = "0.2", features = ["serde"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+clap = { version = "4", features = ["derive", "env"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow = "1"
+
+[profile.release]
+opt-level = "s"     # small binary for the Pi Zero; this program is I/O bound
+lto = true
+codegen-units = 1
+strip = true
+
+[lints.rust]
+unsafe_code = "deny"
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+indexing_slicing = "deny"
+module_name_repetitions = "allow"
+missing_errors_doc = "allow"
+cast_precision_loss = "allow"
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+
+[[bin]]
+name = "device-reporter"
+path = "src/main.rs"
