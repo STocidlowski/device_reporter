@@ -254,21 +254,35 @@ sudo raspi-config  # expand filesystem, set logging to volatile
 sudo shutdown -r now
 ```
 
-## Build the binary for the Pi
+## Build the binary for the Pi (Or skip this section and download the release)
 
 Cross-compile on your PC; the Pi Zero would take an age to compile Rust. From WSL (Ubuntu), with
-[Rust](https://rustup.rs), [zig](https://ziglang.org/download/) and `cargo install cargo-zigbuild`:
+[Rust](https://rustup.rs), [zig](https://ziglang.org/download/) and `cargo install cargo-zigbuild`,
+once:
 
 ```bash
 cd /mnt/c/Users/<you>/PycharmProject/ScaleReporter
-rustup target add arm-unknown-linux-gnueabihf          # Pi Zero W / Zero (ARMv6)
-CARGO_TARGET_DIR=target/pi cargo zigbuild --release --target arm-unknown-linux-gnueabihf.2.31
+rustup target add arm-unknown-linux-gnueabihf     # 32-bit: Pi Zero, Zero W, Pi 1 (ARMv6)
+rustup target add aarch64-unknown-linux-gnu       # 64-bit: Zero 2 W, Pi 3/4/5 on 64-bit Raspberry Pi OS
 ```
 
-The `.2.31` pins glibc 2.31 (Raspberry Pi OS Bullseye), which also runs on Bookworm (2.36). For a
-Zero 2 W, Pi 3/4/5 running 64-bit OS use `aarch64-unknown-linux-gnu` instead. The binary is at
-`target/pi/arm-unknown-linux-gnueabihf/release/device-reporter`, about 2 MB, no dependencies beyond glibc.
-(`CARGO_TARGET_DIR=target/pi` keeps the WSL build out of the Windows `target/` directory.)
+Then, per release:
+
+```bash
+# Pi Zero / Zero W (32-bit)
+CARGO_TARGET_DIR=target/pi cargo zigbuild --release --target arm-unknown-linux-gnueabihf.2.31
+# -> target/pi/arm-unknown-linux-gnueabihf/release/device-reporter
+
+# Pi Zero 2 W, Pi 3/4/5 (64-bit OS)
+CARGO_TARGET_DIR=target/pi cargo zigbuild --release --target aarch64-unknown-linux-gnu.2.31
+# -> target/pi/aarch64-unknown-linux-gnu/release/device-reporter
+```
+
+Pick by the OS you imaged, not only the board: a Zero 2 W running the 32-bit Raspberry Pi OS
+needs the 32-bit binary. `uname -m` on the Pi says `armv6l`/`armv7l` for 32-bit and `aarch64`
+for 64-bit. The `.2.31` pins glibc 2.31 (Raspberry Pi OS Bullseye), which also runs on Bookworm
+(2.36) and newer. Each binary is about 2 MB with no dependencies beyond glibc.
+`CARGO_TARGET_DIR=target/pi` keeps the WSL build out of the Windows `target/` directory.
 
 Copy it over with `scp` as shown in *Transferring it to the Raspberry Pi* above.
 
