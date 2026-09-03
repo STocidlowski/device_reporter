@@ -6,9 +6,24 @@ can flow into the chart without anyone retyping it.
 
 It started life as a Python script for one scale. It is now a generic reporter with a driver per
 device. Drivers so far: the **Health o meter** large-platform scale (1100 / 2000 series, "L" and
-"E" serial versions) over its CP210x USB-to-UART option, and the **McKesson Consult 120** urine
+"E" serial versions) over its CP210x USB-to-UART option and the **McKesson Consult 120** urine
 analyzer over its USB serial port. Adding a device means writing one driver module; everything
 else (detection, hot-plug, the API, the page) is shared.
+
+---
+
+## Current setup at my office:
+![current-setup-scale.jpg](reference/current-setup-scale.jpg)
+
+![current-setup-scale-2.jpg](reference/current-setup-scale-2.jpg)
+
+## Navigating to the **Web UI**
+
+### Scale Web UI
+![device-reporter-scale.png](reference/device-reporter-scale.png)
+
+### Urinalysis UI
+![device-reporter-urinalysis.png](reference/device-reporter-urinalysis.png)
 
 ## What it does
 
