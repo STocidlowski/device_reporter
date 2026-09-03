@@ -98,12 +98,36 @@ pub fn device_id(host: &str, port: &PortCandidate) -> String {
     format!("{host}-{suffix}")
 }
 
+/// [`device_id`], made unique against IDs already in use on this host. Two
+/// `CP210x` bridges both report serial `0001`; the second one gets its port
+/// appended so the two devices never share an identity.
+#[must_use]
+pub fn unique_device_id<'a>(
+    host: &str,
+    port: &PortCandidate,
+    taken: impl Iterator<Item = &'a String>,
+) -> String {
+    let id = device_id(host, port);
+    let mut taken = taken;
+    if taken.any(|t| *t == id) {
+        let suffix = port
+            .name
+            .trim_start_matches('/')
+            .replace(['/', '\\', ' '], "-");
+        tracing::warn!(%id, port = %port.name, "duplicate USB serial number; appending port to device id");
+        return format!("{id}-{suffix}");
+    }
+    id
+}
+
 /// Run forever: scan, spawn, apply events. Exits only when the runtime shuts down.
 pub async fn run(cfg: ManagerConfig, registry: Vec<Arc<dyn Driver>>, state: Arc<AppState>) {
     let (tx, mut rx) = mpsc::channel::<DeviceEvent>(256);
-    let mut running: HashSet<String> = HashSet::new();
+    // Port name -> device id, for every port that has a live connection thread.
+    let mut running: HashMap<String, String> = HashMap::new();
     let mut scan = tokio::time::interval(cfg.scan_interval);
     let mut unpaired_logged: HashSet<String> = HashSet::new();
+    let mut last_failure: HashMap<String, String> = HashMap::new();
 
     if cfg.demo {
         spawn_demo(&cfg, &registry, &tx, &mut running);
@@ -113,13 +137,28 @@ pub async fn run(cfg: ManagerConfig, registry: Vec<Arc<dyn Driver>>, state: Arc<
         tokio::select! {
             _ = scan.tick() => {
                 if !cfg.demo {
-                    scan_and_spawn(&cfg, &registry, &tx, &mut running, &mut unpaired_logged);
+                    scan_and_spawn(&cfg, &registry, &tx, &mut running, &mut unpaired_logged, &last_failure);
                 }
             }
             event = rx.recv() => {
                 let Some(event) = event else { break };
-                if let DeviceEventKind::Disconnected { .. } = &event.kind {
-                    running.remove(&event.device.port);
+                match &event.kind {
+                    DeviceEventKind::Disconnected { reason } => {
+                        running.remove(&event.device.port);
+                        // A port that is busy or absent fails identically every scan;
+                        // say so once at WARN and then only at DEBUG.
+                        let repeat = last_failure.get(&event.device.port) == Some(reason);
+                        if repeat {
+                            tracing::debug!(device = %event.device.id, port = %event.device.port, %reason, "device still unavailable");
+                        } else {
+                            tracing::warn!(device = %event.device.id, port = %event.device.port, %reason, "device disconnected");
+                            last_failure.insert(event.device.port.clone(), reason.clone());
+                        }
+                    }
+                    DeviceEventKind::Connected => {
+                        last_failure.remove(&event.device.port);
+                    }
+                    _ => {}
                 }
                 apply(&state, event);
             }
@@ -131,8 +170,9 @@ fn scan_and_spawn(
     cfg: &ManagerConfig,
     registry: &[Arc<dyn Driver>],
     tx: &mpsc::Sender<DeviceEvent>,
-    running: &mut HashSet<String>,
+    running: &mut HashMap<String, String>,
     unpaired_logged: &mut HashSet<String>,
+    retrying: &HashMap<String, String>,
 ) {
     let ports = match serialport::available_ports() {
         Ok(p) => p,
@@ -146,7 +186,7 @@ fn scan_and_spawn(
 
     for info in &ports {
         let port = PortCandidate::from(info);
-        if running.contains(&port.name) {
+        if running.contains_key(&port.name) {
             continue;
         }
         let kind = match pair(cfg, registry, &port) {
@@ -168,43 +208,53 @@ fn scan_and_spawn(
             continue;
         };
         let device = DeviceInfo {
-            id: device_id(&cfg.host, &port),
+            id: unique_device_id(&cfg.host, &port, running.values()),
             kind: driver.kind().to_owned(),
             display_name: driver.display_name().to_owned(),
             port: port.name.clone(),
         };
-        tracing::info!(device = %device.id, port = %device.port, driver = %device.kind, "opening device");
-        running.insert(port.name.clone());
+        if retrying.contains_key(&port.name) {
+            tracing::debug!(device = %device.id, port = %device.port, driver = %device.kind, "retrying device");
+        } else {
+            tracing::info!(device = %device.id, port = %device.port, driver = %device.kind, "opening device");
+        }
+        running.insert(port.name.clone(), device.id.clone());
         spawn_serial(device, Arc::clone(driver), tx.clone());
     }
 }
 
 fn spawn_serial(device: DeviceInfo, driver: Arc<dyn Driver>, tx: mpsc::Sender<DeviceEvent>) {
-    let spawned = thread::Builder::new().name(format!("dev-{}", device.port)).spawn(move || {
-        let settings = driver.serial_settings();
-        let opened = serialport::new(&device.port, settings.baud)
-            .data_bits(settings.data_bits)
-            .parity(settings.parity)
-            .stop_bits(settings.stop_bits)
-            .timeout(READ_TIMEOUT)
-            .open();
-        let reason = match opened {
-            Ok(mut port) => {
-                let mut session = driver.open_session();
-                let name = device.port.clone();
-                let still_present = move || match serialport::available_ports() {
-                    Ok(ports) => ports.iter().any(|p| p.port_name.eq_ignore_ascii_case(&name)),
-                    Err(_) => true, // enumeration broken; do not tear down a working link
-                };
-                run_connection(&device, &mut port, session.as_mut(), &tx, &still_present)
+    let spawned = thread::Builder::new()
+        .name(format!("dev-{}", device.port))
+        .spawn(move || {
+            let settings = driver.serial_settings();
+            let opened = serialport::new(&device.port, settings.baud)
+                .data_bits(settings.data_bits)
+                .parity(settings.parity)
+                .stop_bits(settings.stop_bits)
+                .timeout(READ_TIMEOUT)
+                .open();
+            let reason = match opened {
+                Ok(mut port) => {
+                    let mut session = driver.open_session();
+                    let name = device.port.clone();
+                    let still_present = move || match serialport::available_ports() {
+                        Ok(ports) => ports
+                            .iter()
+                            .any(|p| p.port_name.eq_ignore_ascii_case(&name)),
+                        Err(_) => true, // enumeration broken; do not tear down a working link
+                    };
+                    run_connection(&device, &mut port, session.as_mut(), &tx, &still_present)
+                }
+                Err(e) => Some(format!("open failed: {e}")),
+            };
+            if let Some(reason) = reason {
+                let _ = tx.blocking_send(DeviceEvent {
+                    device,
+                    kind: DeviceEventKind::Disconnected { reason },
+                });
             }
-            Err(e) => Some(format!("open failed: {e}")),
-        };
-        if let Some(reason) = reason {
-            tracing::warn!(device = %device.id, port = %device.port, %reason, "device disconnected");
-            let _ = tx.blocking_send(DeviceEvent { device, kind: DeviceEventKind::Disconnected { reason } });
-        }
-    });
+        });
     if let Err(e) = spawned {
         tracing::error!(error = %e, "could not spawn device thread");
     }
@@ -214,7 +264,7 @@ fn spawn_demo(
     cfg: &ManagerConfig,
     registry: &[Arc<dyn Driver>],
     tx: &mpsc::Sender<DeviceEvent>,
-    running: &mut HashSet<String>,
+    running: &mut HashMap<String, String>,
 ) {
     let Some(driver) = find_driver(registry, crate::drivers::healthometer::KIND) else {
         return;
@@ -227,7 +277,7 @@ fn spawn_demo(
         port: "demo".to_owned(),
     };
     tracing::info!(device = %device.id, "demo mode: simulating a scale; no serial ports will be opened");
-    running.insert(device.port.clone());
+    running.insert(device.port.clone(), device.id.clone());
     let tx = tx.clone();
     let spawned = thread::Builder::new()
         .name("dev-demo".to_owned())
@@ -251,7 +301,9 @@ fn apply(state: &AppState, event: DeviceEvent) {
     let id = event.device.id.clone();
     match event.kind {
         DeviceEventKind::Connected => state.device_connected(event.device),
-        DeviceEventKind::Disconnected { reason } => state.device_disconnected(&id, reason),
+        DeviceEventKind::Disconnected { reason } => {
+            state.device_disconnected(&event.device, reason);
+        }
         DeviceEventKind::Data { at } => state.device_data(&id, at),
         DeviceEventKind::Active(active) => state.device_active(&id, active),
         DeviceEventKind::Reading(r) => state.publish_reading(r),
@@ -359,5 +411,15 @@ mod tests {
             "generic CP210x serial must be host-prefixed"
         );
         assert_eq!(device_id("pc", &port("COM3", None)), "pc-COM3");
+
+        // Two CP210x scales on one Pi both report serial 0001.
+        let taken = ["pi-0001".to_owned()];
+        let mut q = port("/dev/ttyUSB1", Some((1, 2)));
+        q.serial_number = Some("0001".to_owned());
+        assert_eq!(
+            unique_device_id("pi", &q, taken.iter()),
+            "pi-0001-dev-ttyUSB1"
+        );
+        assert_eq!(unique_device_id("pi", &q, std::iter::empty()), "pi-0001");
     }
 }

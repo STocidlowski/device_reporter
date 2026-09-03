@@ -161,9 +161,10 @@ impl Default for DriverOptions {
 /// Every driver this build knows about.
 #[must_use]
 pub fn registry(opts: &DriverOptions) -> Vec<Arc<dyn Driver>> {
-    vec![Arc::new(
-        crate::drivers::healthometer::HealthometerScale::new(opts),
-    )]
+    vec![
+        Arc::new(crate::drivers::healthometer::HealthometerScale::new(opts)),
+        Arc::new(crate::drivers::consult120::Consult120),
+    ]
 }
 
 /// Look a driver up by its `kind`.
@@ -206,6 +207,7 @@ mod tests {
     fn registry_contains_the_scale_and_lookup_is_case_insensitive() {
         let reg = registry(&DriverOptions::default());
         assert!(find_driver(&reg, "HEALTHOMETER_SCALE").is_some());
+        assert!(find_driver(&reg, "consult120_urinalysis").is_some());
         assert!(find_driver(&reg, "nope").is_none());
     }
 }

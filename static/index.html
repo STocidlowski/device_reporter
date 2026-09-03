@@ -63,7 +63,7 @@
 <script>
 (function () {
   "use strict";
-  const UNIT_LABELS = { "kg": "kg", "[lb_av]": "lb", "cm": "cm", "[in_i]": "in", "kg/m2": "kg/m²", "mm[Hg]": "mmHg", "/min": "bpm", "g/dL": "g/dL" };
+  const UNIT_LABELS = { "kg": "kg", "[lb_av]": "lb", "cm": "cm", "[in_i]": "in", "kg/m2": "kg/m²", "mm[Hg]": "mmHg", "/min": "bpm", "g/dL": "g/dL", "{Leu}/uL": "Leu/µL", "{Ery}/uL": "Ery/µL" };
   const $ = (id) => document.getElementById(id);
   const devices = new Map();     // id -> device status
   const liveByDevice = new Map(); // id -> reading
@@ -73,8 +73,15 @@
 
   function unit(u) { return u ? (UNIT_LABELS[u] || u) : ""; }
   function fmtValue(c) {
-    if (typeof c.value === "number") return `${c.value} ${unit(c.unit)}`.trim();
-    return String(c.value);
+    let v;
+    if (typeof c.value === "number") {
+      const n = c.code === "5811-5" ? c.value.toFixed(3) : String(c.value); // specific gravity reads 1.010
+      v = `${n} ${unit(c.unit)}`.trim();
+    } else {
+      v = String(c.value);
+    }
+    if (c.interpretation && c.interpretation !== v) v += ` (${c.interpretation})`;
+    return v;
   }
   function timeSince(ts) {
     const s = Math.floor((Date.now() - new Date(ts).getTime()) / 1000);

@@ -147,13 +147,29 @@ impl AppState {
         self.broadcast(Event::Device(status));
     }
 
-    /// A connection thread ended.
-    pub fn device_disconnected(&self, id: &str, reason: String) {
-        self.update_device(id, |s| {
-            s.connected = false;
-            s.active = false;
-            s.last_error = Some(reason);
-        });
+    /// A connection thread ended, or the port could not be opened at all. A
+    /// device that never connected is still recorded so the page can show why.
+    pub fn device_disconnected(&self, info: &DeviceInfo, reason: String) {
+        let status = {
+            let mut devices = write(&self.devices);
+            let status = devices
+                .entry(info.id.clone())
+                .or_insert_with(|| DeviceStatus {
+                    info: info.clone(),
+                    connected: false,
+                    last_error: None,
+                    last_data_at: None,
+                    active: false,
+                });
+            let before = status.clone();
+            status.connected = false;
+            status.active = false;
+            status.last_error = Some(reason);
+            (*status != before).then(|| status.clone())
+        };
+        if let Some(status) = status {
+            self.broadcast(Event::Device(status));
+        }
     }
 
     /// Bytes arrived. Does not broadcast: a device sending once per second
@@ -262,7 +278,7 @@ mod tests {
         s.device_active("d", true);
         s.device_active("d", true); // no change, no event
         s.device_data("d", Timestamp::UNIX_EPOCH); // never broadcasts
-        s.device_disconnected("d", "unplugged".to_owned());
+        s.device_disconnected(&info("d"), "unplugged".to_owned());
         s.device_active("ghost", true); // unknown device is ignored
 
         let Ok(Event::Device(d)) = rx.try_recv() else {
@@ -281,5 +297,19 @@ mod tests {
         assert_eq!(d.last_data_at, Some(Timestamp::UNIX_EPOCH));
         assert!(rx.try_recv().is_err());
         assert_eq!(s.server_status().devices.len(), 1);
+
+        // A port that never opened is still listed, with its reason, and repeats do not re-broadcast.
+        s.device_disconnected(&info("busy"), "open failed: Access is denied.".to_owned());
+        let Ok(Event::Device(d)) = rx.try_recv() else {
+            panic!("expected busy device")
+        };
+        assert!(!d.connected);
+        assert_eq!(
+            d.last_error.as_deref(),
+            Some("open failed: Access is denied.")
+        );
+        s.device_disconnected(&info("busy"), "open failed: Access is denied.".to_owned());
+        assert!(rx.try_recv().is_err());
+        assert_eq!(s.server_status().devices.len(), 2);
     }
 }

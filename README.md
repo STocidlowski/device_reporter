@@ -5,10 +5,10 @@ HTTP and WebSocket, so a weight (and soon a blood pressure, a height, a urinalys
 can flow into the chart without anyone retyping it.
 
 It started life as a Python script for one scale. It is now a generic reporter with a driver per
-device. The first and only driver so far is the **Health o meter** large-platform scale
-(1100 / 2000 series, "L" and "E" serial versions) over its CP210x USB-to-UART option. Adding a
-device means writing one driver module; everything else (detection, hot-plug, the API, the page)
-is shared.
+device. Drivers so far: the **Health o meter** large-platform scale (1100 / 2000 series, "L" and
+"E" serial versions) over its CP210x USB-to-UART option, and the **McKesson Consult 120** urine
+analyzer over its USB serial port. Adding a device means writing one driver module; everything
+else (detection, hot-plug, the API, the page) is shared.
 
 ## What it does
 
@@ -152,8 +152,9 @@ stream into one result. Both are pure and unit-tested against the packets printe
    the healthometer driver.
 4. Register it in `driver::registry`.
 
-Devices queued up: urinalysis strip reader, automatic blood-pressure cuff, Detecto sonar
-stadiometer, hemoglobin meter.
+Devices queued up: Welch Allyn Spot Vital Signs LXi,
+Detecto sonar stadiometer, hemoglobin meter. Findings so far, including which port each device
+actually talks on, are in [`docs/devices.md`](docs/devices.md).
 
 ## Project layout
 
@@ -164,7 +165,8 @@ stadiometer, hemoglobin meter.
 │   ├── model.rs       Observation, Component, DeviceStatus, Event: the JSON contract
 │   ├── driver.rs      Driver and DeviceSession traits, port matching, registry
 │   ├── drivers/
-│   │   └── healthometer/   protocol.rs (framing, parsing), session.rs (coalescing), mod.rs (driver)
+│   │   ├── healthometer/   protocol.rs (framing, parsing), session.rs (coalescing), mod.rs (driver)
+│   │   └── consult120.rs   urine analyzer: STX/ETX text report to LOINC components
 │   ├── manager.rs     port scanning, driver pairing, hot-plug, one thread per device
 │   ├── serial.rs      the blocking connection loop shared by every serial driver
 │   ├── state.rs       shared state and the broadcast channel
@@ -172,6 +174,7 @@ stadiometer, hemoglobin meter.
 │   ├── sniff.rs       `list` and `sniff`
 │   └── demo.rs        a fake scale for `--demo`
 ├── static/index.html  the status page, embedded in the binary
+├── docs/devices.md    per-device notes: what is known, what was tried, what is next
 └── reference/         the manufacturer protocol PDF, wiring photos, screenshots
 ```
 

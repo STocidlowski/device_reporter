@@ -32,6 +32,10 @@ pub struct Component {
     pub value: Value,
     /// UCUM unit for quantities, e.g. `kg`, `[lb_av]`, `mm[Hg]`. `None` for text values.
     pub unit: Option<String>,
+    /// Semi-quantitative grade where the device gives one alongside the value,
+    /// e.g. a urine strip's `negative`, `trace`, `1+`. Maps to FHIR `interpretation`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interpretation: Option<String>,
 }
 
 impl Component {
@@ -42,6 +46,7 @@ impl Component {
             display: display.to_owned(),
             value: Value::Quantity(value),
             unit: Some(unit.to_owned()),
+            interpretation: None,
         }
     }
 
@@ -53,6 +58,7 @@ impl Component {
             display: display.to_owned(),
             value: Value::Text(value.to_owned()),
             unit: None,
+            interpretation: None,
         }
     }
 }
