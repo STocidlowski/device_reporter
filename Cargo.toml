@@ -1,10 +1,10 @@
 [package]
 name = "device_reporter"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
-description = "Reads clinic devices (starting with the Health o meter scale) over USB serial and publishes their results over HTTP and WebSocket."
+description = "Reads clinic devices (starting with the Health o meter scale), Urinalysis and POC equipment over USB serial and publishes their results over HTTP and WebSocket."
 license = "MIT"
-repository = "https://github.com/STocidlowski/ScaleReporter"
+repository = "https://github.com/STocidlowski/device_reporter"
 publish = false
 
 [dependencies]
