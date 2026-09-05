@@ -10,6 +10,9 @@ device. Drivers so far: the **Health o meter** large-platform scale (1100 / 2000
 analyzer over its USB serial port. Adding a device means writing one driver module; everything
 else (detection, hot-plug, the API, the page) is shared.
 
+> Upgrading a Pi from a build without the settings page? See
+> [secure deployment](docs/security-deployment.md) first: the flags now seed a settings file.
+
 ---
 
 ## Current setup at my office:
@@ -34,24 +37,21 @@ else (detection, hot-plug, the API, the page) is shared.
   they step off. A different weight (a child hopping on after a parent) starts a new one.
 - **Plausibility flags for the clinician.** `below_minimum` for a bag or a foot on the platform,
   `single_packet` when the scale only re-displayed a previous weight (RECALL/UNITS button).
-- **FHIR-ready output.** Every result carries LOINC codes and UCUM units, so the EMR can build
-  `Observation` resources without device-specific knowledge.
+- **FHIR output.** Every result carries LOINC codes and UCUM units and is forwarded to any
+  FHIR R5 server as a preliminary `Observation`, for a clinician to accept into the right chart.
 - **Live page**, REST API, and a WebSocket stream with reconnection and keep-alive pings.
 - **`list` and `sniff` subcommands** for reverse-engineering the next device's protocol.
 - **Single static binary**, cross-compiled for the Raspberry Pi Zero W. No Python, no venv, no driver
   install on Linux.
 
-## HIPAA / Security
+## Security
 
-This is a work in progress and does not by itself protect health information. It serves plain
-HTTP on the address you bind it to, with no authentication. Results contain a weight, timestamps,
-and whatever ID was typed on the device keypad.
-
-Mitigations used here: bind to loopback and put nginx in front; run the Pi on
-[Tailscale](https://tailscale.com/) and let UFW admit only the tailnet (see below); keep logs at
-INFO, which never print device-entered IDs. Extreme care must be used in order to avoid HIPAA
-violations. You have been warned; this project and its contributors accept no responsibility for
-how it is deployed.
+The tailnet is the perimeter: with Tailscale and the firewall rules below, only enrolled devices
+can reach the page or SSH. Readings are visible to anyone who can open the page. Changing the
+EMR destination, credentials or port assignments can be gated by an optional settings password,
+set from the page. State files are private, written atomically and locked against a second
+writer. Details and a hardened service unit are in
+[secure deployment](docs/security-deployment.md).
 
 ---
 ## Transferring it to the Raspberry Pi:
@@ -78,7 +78,8 @@ cargo run --release -- list            # serial ports with VID:PID, serial numbe
 cargo run --release -- sniff COM5      # hex + text dump of whatever COM5 sends
 ```
 
-Open http://localhost:8080/ and step on the scale.
+Open http://127.0.0.1:8080/ and step on the scale. Demo mode uses the same settings and queue
+as a real run, so a demo with an EMR destination configured will send simulated readings there.
 
 Every flag has an environment variable (`DR_*`); run `device-reporter --help`. The ones you will
 actually use:
@@ -86,27 +87,89 @@ actually use:
 | Flag | Env | Default | Purpose |
 |---|---|---|---|
 | `--bind` | `DR_BIND` | `127.0.0.1:8080` | Listen address. Use `0.0.0.0:8080` to reach it from another machine without nginx. |
-| `--assign PORT=DRIVER` | `DR_ASSIGN` | | Force a driver onto a port, e.g. `/dev/scale=healthometer_scale`. |
-| `--fallback-driver` | `DR_FALLBACK_DRIVER` | | Driver for `/dev/ttyUSB*` or `/dev/ttyACM*` ports that expose no USB descriptors. Normally unnecessary; the CP210x is recognised by VID:PID. |
-| `--cors-origin` | `DR_CORS_ORIGIN` | | Browser origins allowed to call the API cross-origin; needed for the WASM build of the EMR client. |
-| `--host` | `DR_HOST` | hostname | Name reported as `host` and used in device IDs. |
-| `--scale-quiet-ms` | `DR_SCALE_QUIET_MS` | `2500` | Silence that ends a weigh-in. |
-| `--scale-min-weight-kg` | `DR_SCALE_MIN_WEIGHT_KG` | `1` | Below this the result is flagged `below_minimum`. |
+| `--settings` | `DR_SETTINGS` | `device-reporter-settings.json` | The settings file the web page edits (see **Settings** below). |
+| `--queue-file` | `DR_QUEUE_FILE` | `device-reporter-queue.json` | Durable queue of observations awaiting forwarding; survives restarts. |
+| `--history` | `DR_HISTORY` | `100` | How many observations to keep in memory. |
+| `--scan-secs` | `DR_SCAN_SECS` | `3` | Seconds between serial port scans. |
+| `--demo` | `DR_DEMO` | | Simulate a scale instead of opening serial ports. |
+
+The remaining flags seed a **new file only**. An existing file is authoritative, including
+explicitly cleared values: change them on the page, not in the environment file.
+
+| Seed flag | Env | Setting |
+|---|---|---|
+| `--forward-url` | `DR_FORWARD_URL` | EMR FHIR base, e.g. `http://emr:8000/fhir/v5`. Unset pauses delivery; readings stay queued. |
+| `--forward-api-key` | `DR_FORWARD_API_KEY` | EMR API key, sent as `X-API-Key`. |
+| `--forward-token` | `DR_FORWARD_TOKEN` | Bearer token (SMART client-credentials). |
+| `--assign PORT=DRIVER` | `DR_ASSIGN` | Force a driver onto a port, e.g. `/dev/ttyUSB1=consult120_urinalysis`. |
+| `--fallback-driver` | `DR_FALLBACK_DRIVER` | Driver for `/dev/ttyUSB*` ports that expose no USB descriptors. Rarely needed. |
+| `--cors-origin` | `DR_CORS_ORIGIN` | Browser origins allowed to call the API cross-origin (the WASM EMR client). |
+| `--host` | `DR_HOST` | Name reported as `host` and used in device IDs. Defaults to the hostname. |
+| `--scale-quiet-ms` | `DR_SCALE_QUIET_MS` | Silence that ends a weigh-in (default 2500). |
+| `--scale-min-weight-kg` | `DR_SCALE_MIN_WEIGHT_KG` | Below this a result is flagged `below_minimum` (default 1). |
 
 On Windows the scale needs the Silicon Labs
 [CP210x driver](https://www.silabs.com/developer-tools/usb-to-uart-bridge-vcp-drivers). Linux has
 it built in.
 
+## Settings
+
+The settings section at the bottom of the page edits the EMR destination and credentials, port
+assignments, the fallback driver, the host name, CORS origins and the scale thresholds. The EMR
+fields apply immediately; the others say when a restart is needed.
+
+**Password.** Optional. Until one is set, anyone who can open the page can change settings, and
+the page says so. Set one under *Set a settings password*; from then on every save must carry it.
+Wrong passwords lock changes for 1 s, doubling each time up to two hours. To change or remove it
+you need the current one. Forgot it? Stop the service and run
+`device-reporter set-password --password-file <file>` (the file holds only the new password) or
+delete the `password_hash` line from the settings file.
+
+**Secrets.** The API key never comes back out of the page: it shows only its last four
+characters, and the bearer token only as set or not set. Changing the destination URL clears
+both, so a saved key cannot be pointed at another server. The settings file itself holds the key
+in cleartext with mode 0600; a damaged file stops the service rather than starting with defaults.
+
+## Forwarding to the EMR
+
+The destination is any **FHIR R5 server**, not something specific to my EMR. The reporter needs
+three things from it: `PUT /Observation/{id}` with a client-chosen id (create-on-update),
+`GET /Observation/{id}`, and a way to hand over a credential (`X-API-Key` or a bearer token).
+That is a standard FHIR base URL such as `https://fhir.example.org/baseR5`; it is verified
+against the public [HAPI FHIR](https://hapi.fhir.org) R5 sandbox as well as my own server.
+The EMR side of the workflow (showing preliminary results and letting a clinician accept them)
+is up to whatever sits on that server; mine shows them in a "Device Results" window where a
+clinician accepts each one into the open chart or discards it.
+
+Every completed reading is written to the queue file before it is shown on the page, so nothing
+is lost if the EMR is down or a browser is slow. The forwarder sends each one as a preliminary,
+subject-less FHIR Observation with `PUT /Observation/{id}`, where the id is chosen by the
+reporter. A clinician then accepts or discards it in the EMR.
+
+A retry never overwrites a reading a clinician has already accepted: the attempt is recorded on
+disk before each send, and a retried reading is checked with `GET` first. Credential failures
+(401/403) keep readings pending and are named on the page; 400/422 move a reading to a rejected
+list that `device-reporter retry-rejected` requeues once the cause is fixed. *Test EMR
+connection* sends a credentialed request so it verifies the key, not just the address. The page
+shows pending and rejected counts and the last delivery message. See
+[secure deployment](docs/security-deployment.md).
+
 ## API
 
 | Route | Returns |
 |---|---|
-| `GET /` | The status page. |
-| `GET /api/status` | Process info plus every device seen since start. |
+| `GET /` | The page. |
+| `GET /api/status` | Process info, every device seen since start, and forwarding health (`forwarding.pending`, `rejected`, `message`, `storage_error`). |
 | `GET /api/devices` | Just the device list. |
 | `GET /api/latest[?device=ID]` | Most recent observation, optionally from one device. 404 until there is one. |
 | `GET /api/observations[?device=ID&limit=N]` | Recent observations, newest first. |
+| `GET /api/settings` | Settings with secrets redacted, plus lockout and restart state. |
+| `PUT /api/settings` | Change settings: `{"password": "…", "settings": {…}}`. 401 when a password is set and missing or wrong, 423 (`retry_after_secs`) while locked out, 400 for an invalid value. |
+| `PUT /api/settings/password` | `{"current": "…", "new": "…"}`. Omit `current` when none is set; omit `new` to remove the password. |
+| `POST /api/settings/test` | Probe the configured EMR with the saved credentials; returns `ok`, the HTTP `status` and a `message`. |
 | `GET /ws` | Live event stream (below). |
+
+Request bodies are limited to 16 KB and responses carry `Cache-Control: no-store`.
 
 ### Events
 
@@ -186,6 +249,10 @@ actually talks on, are in [`docs/devices.md`](docs/devices.md).
 │   ├── serial.rs      the blocking connection loop shared by every serial driver
 │   ├── state.rs       shared state and the broadcast channel
 │   ├── web.rs         axum routes and the WebSocket
+│   ├── fhir.rs        reporter observation -> FHIR R5 Observation JSON
+│   ├── forward.rs     durable queue that posts observations to the EMR
+│   ├── settings.rs    the settings file, optional password (Argon2id), lockout
+│   ├── storage.rs     private atomic file writes and the single-writer lock
 │   ├── sniff.rs       `list` and `sniff`
 │   └── demo.rs        a fake scale for `--demo`
 ├── static/index.html  the status page, embedded in the binary
@@ -351,12 +418,24 @@ journalctl -u device-reporter.service -f      # follow the logs
 
 To upgrade: `sudo systemctl stop device-reporter`, `scp` the new binary over, then
 `sudo systemctl start device-reporter`. Copying while the service runs fails with "text file
-busy" because Linux will not overwrite an executable that is in use.
+busy" because Linux will not overwrite an executable that is in use. The settings and queue
+files live in the working directory; stop the service before touching them.
 
 `DR_BIND=127.0.0.1` means only nginx on the Pi can reach it, which is what you want once the next
-section is done. For testing without nginx, use `0.0.0.0:8080`.
+section is done. For testing without nginx, use `0.0.0.0:8080`. A hardened unit with a
+dedicated account is in [secure deployment](docs/security-deployment.md).
 
-## Optional basic security improvements
+## Connecting the Pi to the EMR
+
+Issue an API key (or a client-credentials token) on the FHIR server for this Pi. Prefer a key
+that does not expire on a timer: an unattended device that silently stops forwarding one day is
+worse than one whose key you revoke deliberately if it is ever lost. Open the Pi's page, enter
+the FHIR base and the key in Settings and press *Test EMR connection*. Set a settings password
+while you are there. Take a synthetic reading and confirm it shows up as a preliminary
+Observation on the server; a clinician still has to accept it into the right chart. If a Pi is
+lost, revoke its key and its Tailscale node.
+
+## Network configuration
 
 ### Tailscale
 
@@ -411,7 +490,7 @@ Now http://scale-pi/ works from any tailnet device.
 
 ### UFW firewall
 
-Admit SSH and HTTP only over Tailscale:
+Admit SSH and the page only over Tailscale, further limited by the tailnet ACL:
 
 ```bash
 sudo apt install ufw -y
@@ -419,7 +498,6 @@ sudo ufw default deny incoming
 sudo ufw default allow outgoing
 sudo ufw allow in on tailscale0 to any port 22
 sudo ufw allow in on tailscale0 to any port 80
-sudo ufw allow in on tailscale0 to any port 443
 sudo ufw allow 41641/udp           # helps Tailscale connect peer-to-peer
 sudo ufw status numbered
 sudo ufw enable
@@ -433,11 +511,12 @@ That is a zero-trust setup: only authorized devices can reach the Pi at all.
 
 ## Next: into the chart
 
-The plan is for the EMR client (front_desk, an egui app that already speaks WebSocket) to
-subscribe to `/ws`, and when an `observation` arrives while a chart is open, show it as a
-**pending** vital: "Weight 184.5 lb from the Room 2 scale, 12 s ago. Accept into this chart?" The
-clinician confirms it is the right person (not their kid playing on the scale) and the client
-writes a FHIR `Observation` with device provenance. Nothing is charted automatically.
+Today the EMR client polls the FHIR server for preliminary, subject-less Observations and shows
+each one as a **pending** vital: "Weight 184.5 lb from the Room 2 scale, 12 s ago. Accept into
+this chart?" The clinician confirms it is the right person (not their kid playing on the scale)
+and the client finalises the `Observation` with the patient, encounter and performer. Nothing is
+charted automatically. The next step is a push (the EMR client already speaks WebSocket) so the
+prompt appears the moment the reading completes instead of on the next poll.
 
 Longer term the Pi should post observations to the FHIR server instead, which gives a device
 registry, room-to-device mapping, an audit trail, and a pending queue that survives client

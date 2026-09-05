@@ -2,3 +2,16 @@
 /.venv
 __pycache__/
 *.pyc
+
+# Runtime secrets and retained clinical measurements belong in private state storage.
+device-reporter-settings.json
+device-reporter-queue.json
+*.settings.lock
+*.queue.lock
+*.rejected.jsonl
+.dr-*.tmp
+*.json.tmp
+*.env
+
+# Local integration notes about my (private) EMR; not part of the public project.
+docs/emr-integration.md

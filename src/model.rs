@@ -129,6 +129,15 @@ pub struct ServerStatus {
     pub version: String,
     pub started_at: Timestamp,
     pub devices: Vec<DeviceStatus>,
+    pub forwarding: ForwardStatus,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ForwardStatus {
+    pub pending: usize,
+    pub rejected: usize,
+    pub message: String,
+    pub storage_error: Option<String>,
 }
 
 /// Everything that goes over the WebSocket, tagged by `type`.

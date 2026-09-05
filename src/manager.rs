@@ -4,10 +4,14 @@
 //! Every `scan_interval` the manager enumerates serial ports. A port that is
 //! not already running gets a driver by, in order:
 //!
-//! 1. an explicit `--assign PORT=KIND`,
+//! 1. an explicit assignment (`--assign PORT=KIND` or the settings page),
 //! 2. the first driver whose `matches` accepts the port's USB descriptors,
-//! 3. `--fallback-driver KIND` for `/dev/ttyUSB*`/`/dev/ttyACM*` ports that
+//! 3. the fallback driver for `/dev/ttyUSB*`/`/dev/ttyACM*` ports that
 //!    expose no USB descriptors at all (rare; sysfs normally provides them).
+//!
+//! Assignments and the fallback are read from the [`SettingsStore`] on every
+//! scan, so a change on the settings page applies to the next port that
+//! appears without a restart.
 //!
 //! When a connection thread ends (unplug, read error) the port is forgotten
 //! and picked up again on a later scan if it reappears. Hot-plug therefore
@@ -17,6 +21,7 @@ use crate::demo::DemoTransport;
 use crate::driver::{Driver, PortCandidate, find_driver};
 use crate::model::DeviceInfo;
 use crate::serial::{DeviceEvent, DeviceEventKind, READ_TIMEOUT, run_connection};
+use crate::settings::SettingsStore;
 use crate::state::AppState;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -24,18 +29,33 @@ use std::thread;
 use std::time::Duration;
 use tokio::sync::mpsc;
 
-/// How the manager is configured from the CLI.
+/// How the manager is configured at startup.
 #[derive(Debug, Clone)]
 pub struct ManagerConfig {
     /// This machine's name; used to build device IDs when USB has no serial number.
     pub host: String,
-    /// Port name to driver kind, from `--assign`.
-    pub assignments: HashMap<String, String>,
-    /// Driver for descriptor-less ports, from `--fallback-driver`.
-    pub fallback_kind: Option<String>,
     pub scan_interval: Duration,
     /// Run a simulated scale instead of touching hardware.
     pub demo: bool,
+}
+
+/// The pairing rules in force for one scan, taken from the settings.
+#[derive(Debug, Clone, Default)]
+pub struct PairingRules {
+    /// Port name to driver kind.
+    pub assignments: HashMap<String, String>,
+    /// Driver for descriptor-less USB-looking ports.
+    pub fallback_kind: Option<String>,
+}
+
+impl PairingRules {
+    fn from_settings(settings: &SettingsStore) -> Self {
+        let s = settings.snapshot();
+        Self {
+            assignments: s.assignments.into_iter().collect(),
+            fallback_kind: s.fallback_driver,
+        }
+    }
 }
 
 /// Which driver to use for a port, or why none.
@@ -48,8 +68,8 @@ pub enum Pairing {
 }
 
 /// Pure pairing logic, separated so it can be tested without serial hardware.
-pub fn pair(cfg: &ManagerConfig, registry: &[Arc<dyn Driver>], port: &PortCandidate) -> Pairing {
-    if let Some(kind) = cfg
+pub fn pair(rules: &PairingRules, registry: &[Arc<dyn Driver>], port: &PortCandidate) -> Pairing {
+    if let Some(kind) = rules
         .assignments
         .iter()
         .find(|(p, _)| p.eq_ignore_ascii_case(&port.name))
@@ -58,7 +78,7 @@ pub fn pair(cfg: &ManagerConfig, registry: &[Arc<dyn Driver>], port: &PortCandid
         return if let Some(d) = find_driver(registry, kind) {
             Pairing::Assigned(d.kind().to_owned())
         } else {
-            tracing::warn!(port = %port.name, %kind, "--assign names an unknown driver; ignoring the port");
+            tracing::warn!(port = %port.name, %kind, "assignment names an unknown driver; ignoring the port");
             Pairing::Unassigned
         };
     }
@@ -70,7 +90,7 @@ pub fn pair(cfg: &ManagerConfig, registry: &[Arc<dyn Driver>], port: &PortCandid
     }
     // No descriptors: only guess for USB-looking nodes, never for on-board UARTs.
     if (port.name.starts_with("/dev/ttyUSB") || port.name.starts_with("/dev/ttyACM"))
-        && let Some(kind) = &cfg.fallback_kind
+        && let Some(kind) = &rules.fallback_kind
         && let Some(d) = find_driver(registry, kind)
     {
         return Pairing::Fallback(d.kind().to_owned());
@@ -121,7 +141,13 @@ pub fn unique_device_id<'a>(
 }
 
 /// Run forever: scan, spawn, apply events. Exits only when the runtime shuts down.
-pub async fn run(cfg: ManagerConfig, registry: Vec<Arc<dyn Driver>>, state: Arc<AppState>) {
+pub async fn run(
+    cfg: ManagerConfig,
+    registry: Vec<Arc<dyn Driver>>,
+    settings: Arc<SettingsStore>,
+    state: Arc<AppState>,
+    outbox: Option<Arc<crate::forward::Outbox>>,
+) {
     let (tx, mut rx) = mpsc::channel::<DeviceEvent>(256);
     // Port name -> device id, for every port that has a live connection thread.
     let mut running: HashMap<String, String> = HashMap::new();
@@ -137,7 +163,8 @@ pub async fn run(cfg: ManagerConfig, registry: Vec<Arc<dyn Driver>>, state: Arc<
         tokio::select! {
             _ = scan.tick() => {
                 if !cfg.demo {
-                    scan_and_spawn(&cfg, &registry, &tx, &mut running, &mut unpaired_logged, &last_failure);
+                    let rules = PairingRules::from_settings(&settings);
+                    scan_and_spawn(&cfg, &rules, &registry, &tx, &mut running, &mut unpaired_logged, &last_failure);
                 }
             }
             event = rx.recv() => {
@@ -160,6 +187,23 @@ pub async fn run(cfg: ManagerConfig, registry: Vec<Arc<dyn Driver>>, state: Arc<
                     }
                     _ => {}
                 }
+                if let DeviceEventKind::Observation(observation) = &event.kind
+                    && let Some(outbox) = &outbox {
+                        loop {
+                            let queue = Arc::clone(outbox);
+                            let reading = observation.clone();
+                            let result = tokio::task::spawn_blocking(move || queue.ingest(&reading)).await;
+                            if matches!(result, Ok(Ok(()))) {
+                                state.forward_storage_error(None);
+                                let (pending, rejected) = outbox.counts();
+                                state.forward_counts(pending, rejected);
+                                break;
+                            }
+                            state.forward_storage_error(Some("Cannot persist a completed reading. Capture is paused; check storage and outbox capacity."));
+                            tracing::error!("reading not persisted; capture paused while storage recovers");
+                            tokio::time::sleep(Duration::from_secs(5)).await;
+                        }
+                }
                 apply(&state, event);
             }
         }
@@ -168,6 +212,7 @@ pub async fn run(cfg: ManagerConfig, registry: Vec<Arc<dyn Driver>>, state: Arc<
 
 fn scan_and_spawn(
     cfg: &ManagerConfig,
+    rules: &PairingRules,
     registry: &[Arc<dyn Driver>],
     tx: &mpsc::Sender<DeviceEvent>,
     running: &mut HashMap<String, String>,
@@ -189,7 +234,7 @@ fn scan_and_spawn(
         if running.contains_key(&port.name) {
             continue;
         }
-        let kind = match pair(cfg, registry, &port) {
+        let kind = match pair(rules, registry, &port) {
             Pairing::Assigned(k) | Pairing::Matched(k) | Pairing::Fallback(k) => k,
             Pairing::Unassigned => {
                 if unpaired_logged.insert(port.name.clone()) {
@@ -198,7 +243,7 @@ fn scan_and_spawn(
                         vid = port.vid.map(|v| format!("{v:04x}")).unwrap_or_default(),
                         pid = port.pid.map(|v| format!("{v:04x}")).unwrap_or_default(),
                         product = port.product.clone().unwrap_or_default(),
-                        "serial port with no matching driver (use --assign PORT=KIND or `sniff` to investigate)"
+                        "serial port with no matching driver (assign a driver on the settings page or `sniff` to investigate)"
                     );
                 }
                 continue;
@@ -328,16 +373,13 @@ mod tests {
     use crate::driver::{DriverOptions, registry};
     use crate::drivers::healthometer::{CP210X_PID, CP210X_VID, KIND};
 
-    fn cfg(assign: &[(&str, &str)], fallback: Option<&str>) -> ManagerConfig {
-        ManagerConfig {
-            host: "pi".to_owned(),
+    fn rules(assign: &[(&str, &str)], fallback: Option<&str>) -> PairingRules {
+        PairingRules {
             assignments: assign
                 .iter()
                 .map(|(p, k)| ((*p).to_owned(), (*k).to_owned()))
                 .collect(),
             fallback_kind: fallback.map(str::to_owned),
-            scan_interval: Duration::from_secs(3),
-            demo: false,
         }
     }
 
@@ -357,7 +399,7 @@ mod tests {
         let reg = registry(&DriverOptions::default());
         let p = port("COM7", Some((CP210X_VID, CP210X_PID)));
         assert_eq!(
-            pair(&cfg(&[], None), &reg, &p),
+            pair(&rules(&[], None), &reg, &p),
             Pairing::Matched(KIND.to_owned())
         );
     }
@@ -366,7 +408,7 @@ mod tests {
     fn unknown_usb_devices_stay_unassigned_even_with_a_fallback() {
         let reg = registry(&DriverOptions::default());
         let p = port("COM1", Some((0x067B, 0x2303)));
-        assert_eq!(pair(&cfg(&[], Some(KIND)), &reg, &p), Pairing::Unassigned);
+        assert_eq!(pair(&rules(&[], Some(KIND)), &reg, &p), Pairing::Unassigned);
     }
 
     #[test]
@@ -374,11 +416,11 @@ mod tests {
         let reg = registry(&DriverOptions::default());
         let p = port("com1", Some((0x067B, 0x2303)));
         assert_eq!(
-            pair(&cfg(&[("COM1", KIND)], None), &reg, &p),
+            pair(&rules(&[("COM1", KIND)], None), &reg, &p),
             Pairing::Assigned(KIND.to_owned())
         );
         assert_eq!(
-            pair(&cfg(&[("COM1", "bogus")], None), &reg, &p),
+            pair(&rules(&[("COM1", "bogus")], None), &reg, &p),
             Pairing::Unassigned
         );
     }
@@ -387,15 +429,15 @@ mod tests {
     fn descriptorless_tty_usb_uses_fallback_but_onboard_uart_never_does() {
         let reg = registry(&DriverOptions::default());
         assert_eq!(
-            pair(&cfg(&[], Some(KIND)), &reg, &port("/dev/ttyUSB0", None)),
+            pair(&rules(&[], Some(KIND)), &reg, &port("/dev/ttyUSB0", None)),
             Pairing::Fallback(KIND.to_owned())
         );
         assert_eq!(
-            pair(&cfg(&[], Some(KIND)), &reg, &port("/dev/ttyAMA0", None)),
+            pair(&rules(&[], Some(KIND)), &reg, &port("/dev/ttyAMA0", None)),
             Pairing::Unassigned
         );
         assert_eq!(
-            pair(&cfg(&[], None), &reg, &port("/dev/ttyUSB0", None)),
+            pair(&rules(&[], None), &reg, &port("/dev/ttyUSB0", None)),
             Pairing::Unassigned
         );
     }
@@ -421,5 +463,21 @@ mod tests {
             "pi-0001-dev-ttyUSB1"
         );
         assert_eq!(unique_device_id("pi", &q, std::iter::empty()), "pi-0001");
+    }
+
+    #[test]
+    fn rules_come_from_the_settings_store() {
+        let dir = std::env::temp_dir().join(format!("dr-mgr-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let seed = crate::settings::Settings {
+            assignments: std::collections::BTreeMap::from([("COM9".to_owned(), KIND.to_owned())]),
+            fallback_driver: Some(KIND.to_owned()),
+            ..crate::settings::Settings::default()
+        };
+        let store =
+            SettingsStore::open(dir.join("settings.json"), &seed, vec![KIND.to_owned()]).unwrap();
+        let r = PairingRules::from_settings(&store);
+        assert_eq!(r.assignments.get("COM9").map(String::as_str), Some(KIND));
+        assert_eq!(r.fallback_kind.as_deref(), Some(KIND));
     }
 }

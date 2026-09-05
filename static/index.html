@@ -30,11 +30,21 @@
   th { color: var(--muted); font-weight: 600; }
   #live { font-size: .95rem; }
   .hidden { display: none; }
+  form.settings { display: grid; grid-template-columns: max-content 1fr; gap: 8px 12px; align-items: center; }
+  form.settings label { color: var(--muted); font-size: .9rem; }
+  form.settings input[type=text], form.settings input[type=password], form.settings input[type=number], form.settings textarea { width: 100%; box-sizing: border-box; font: inherit; padding: 6px 8px; border: 1px solid var(--line); border-radius: 6px; background: #fff; }
+  form.settings .span { grid-column: 1 / -1; }
+  .msg { font-size: .9rem; margin-top: 8px; min-height: 1.2em; }
+  .msg.ok { color: var(--ok); } .msg.bad { color: var(--bad); } .msg.warn { color: var(--warn); }
+  .detail.warn { color: var(--warn); }
+  button.secondary { background: var(--muted); }
+  details summary { cursor: pointer; font-weight: 600; }
 </style>
 </head>
 <body>
   <h1>Device Reporter</h1>
   <div id="conn"><span class="dot" id="conn-dot"></span><span id="conn-text">Connecting…</span></div>
+  <div id="forward-health" class="detail"></div>
 
   <h2>Devices</h2>
   <div id="devices" class="cards"><div class="muted">No devices seen yet.</div></div>
@@ -60,6 +70,56 @@
     <tbody id="history"></tbody>
   </table>
 
+  <h2>Settings</h2>
+  <div class="card">
+    <div class="detail" id="settings-state">Loading…</div>
+    <form class="settings" id="settings-form" autocomplete="off">
+      <label for="s-forward-url">EMR FHIR base URL</label>
+      <input type="text" id="s-forward-url" placeholder="https://emr.example/fhir/v5 (blank = forwarding paused)">
+      <label for="s-api-key">EMR API key</label>
+      <input type="password" id="s-api-key" placeholder="unchanged">
+      <label for="s-token">Bearer token (SMART)</label>
+      <input type="password" id="s-token" placeholder="unchanged">
+      <label for="s-host">Host name</label>
+      <input type="text" id="s-host" placeholder="defaults to the machine name (restart to apply)">
+      <label for="s-cors">CORS origins</label>
+      <input type="text" id="s-cors" placeholder="explicit origins only (restart to apply)">
+      <label for="s-fallback">Fallback driver</label>
+      <input type="text" id="s-fallback" placeholder="for /dev/ttyUSB* ports with no USB descriptors">
+      <label for="s-assign">Port assignments</label>
+      <textarea id="s-assign" rows="3" placeholder="one per line: /dev/ttyUSB1=consult120_urinalysis"></textarea>
+      <label for="s-quiet">Scale quiet time (ms)</label>
+      <input type="number" id="s-quiet" min="500" max="60000" step="100">
+      <label for="s-minkg">Scale minimum weight (kg)</label>
+      <input type="number" id="s-minkg" min="0" max="50" step="0.1">
+      <label for="s-password" id="s-password-label">Settings password</label>
+      <input type="password" id="s-password" placeholder="required to save changes" maxlength="1024" autocomplete="current-password">
+      <div class="span">
+        <button type="submit" id="s-save">Save settings</button>
+        <button type="button" class="secondary" id="s-test">Test EMR connection</button>
+        <button type="button" class="secondary" id="s-clear-key" title="Remove the stored API key on save">Clear API key</button>
+        <button type="button" class="secondary" id="s-clear-token" title="Remove the stored bearer token on save">Clear token</button>
+        <div class="msg" id="s-msg"></div>
+      </div>
+    </form>
+    <details style="margin-top:12px">
+      <summary id="pw-summary">Set a settings password</summary>
+      <form class="settings" id="password-form" autocomplete="off" style="margin-top:8px">
+        <label for="pw-current">Current password</label>
+        <input type="password" id="pw-current" placeholder="only when one is set">
+        <label for="pw-new">New password</label>
+        <input type="password" id="pw-new" placeholder="at least 8 characters" required minlength="8" maxlength="1024">
+        <label for="pw-confirm">Confirm new password</label>
+        <input type="password" id="pw-confirm">
+        <div class="span">
+          <button type="submit" id="pw-save">Set password</button>
+          <div class="msg" id="pw-msg"></div>
+        </div>
+      </form>
+    </details>
+    <div class="detail" style="margin-top:8px">Known drivers: <span id="s-drivers"></span>. File: <span id="s-path"></span>.</div>
+  </div>
+
 <script>
 (function () {
   "use strict";
@@ -70,6 +130,7 @@
   let latest = null;
   const history = [];
   const HISTORY_MAX = 25;
+  let socket = null;
 
   function unit(u) { return u ? (UNIT_LABELS[u] || u) : ""; }
   function fmtValue(c) {
@@ -202,12 +263,15 @@
 
   let retryMs = 1000;
   function connect() {
+    if (socket) return;
     const proto = location.protocol === "https:" ? "wss" : "ws";
     const ws = new WebSocket(`${proto}://${location.host}/ws`);
+    socket = ws;
     ws.onopen = () => { retryMs = 1000; $("conn-dot").className = "dot ok"; $("conn-text").textContent = `Connected to ${location.host}`; };
-    ws.onmessage = (e) => { try { handle(JSON.parse(e.data)); } catch (err) { console.error("bad event", err); } };
+    ws.onmessage = (e) => { if (socket !== ws) return; try { handle(JSON.parse(e.data)); } catch (err) { console.error("bad event", err); } };
     ws.onerror = () => ws.close();
     ws.onclose = () => {
+      if (socket === ws) socket = null;
       $("conn-dot").className = "dot";
       $("conn-text").textContent = `Disconnected from ${location.host}; retrying in ${Math.round(retryMs / 1000)}s`;
       for (const d of devices.values()) d.connected = false;
@@ -217,8 +281,114 @@
     };
   }
 
-  setInterval(() => { renderLive(); if (latest) renderLatest(); renderDevices(); }, 1000);
+  // ---- Settings -----------------------------------------------------------
+  let clearKey = false, clearToken = false;
+  function setMsg(id, text, cls) { const m = $(id); m.textContent = text; m.className = "msg " + (cls || ""); }
+  function showSettings(r) {
+    $("s-forward-url").value = r.forward_url || "";
+    $("s-api-key").value = ""; $("s-api-key").placeholder = r.forward_api_key_hint ? `set (${r.forward_api_key_hint}); type to replace` : "not set";
+    $("s-token").value = ""; $("s-token").placeholder = r.forward_token_set ? "set; type to replace" : "not set";
+    $("s-host").value = r.host || "";
+    $("s-cors").value = (r.cors_origins || []).join(", ");
+    $("s-fallback").value = r.fallback_driver || "";
+    $("s-assign").value = Object.entries(r.assignments || {}).map(([p, k]) => `${p}=${k}`).join("\n");
+    $("s-quiet").value = r.scale_quiet_ms;
+    $("s-minkg").value = r.scale_min_weight_kg;
+    $("s-drivers").textContent = (r.known_drivers || []).join(", ");
+    $("s-path").textContent = r.settings_path || "";
+    $("pw-summary").textContent = r.password_set ? "Change or remove the settings password" : "Set a settings password";
+    $("pw-save").textContent = r.password_set ? "Change password" : "Set password";
+    $("pw-current").disabled = !r.password_set;
+    $("pw-current").placeholder = r.password_set ? "" : "none set yet";
+    $("pw-new").required = r.password_set ? false : true;
+    $("pw-new").placeholder = r.password_set ? "at least 8 characters; leave blank to remove the password" : "at least 8 characters";
+    $("s-password").disabled = !r.password_set;
+    $("s-password").placeholder = r.password_set ? "required to save changes" : "none set: anyone who can open this page can change settings";
+    const bits = [];
+    if (!r.password_set) bits.push("no settings password is set");
+    if (r.locked_for_secs) bits.push(`locked for ${r.locked_for_secs} s after wrong passwords`);
+    if (r.restart_required) bits.push("a saved change needs a service restart");
+    if (!r.forward_url) bits.push("forwarding to the EMR is off");
+    $("settings-state").textContent = bits.length ? bits.join(" · ") : "Changes to the EMR destination apply immediately.";
+    $("settings-state").className = "detail" + (r.locked_for_secs || r.restart_required ? " warn" : "");
+    clearKey = false; clearToken = false;
+  }
+  async function loadSettings() {
+    try {
+      const r = await fetch("/api/settings", { cache: "no-store" });
+      if (r.ok) { showSettings(await r.json()); return true; }
+    } catch (e) { $("settings-state").textContent = "Could not load settings."; }
+    return false;
+  }
+  async function settingsCall(url, body) {
+    try {
+    const r = await fetch(url, { method: ["/api/settings", "/api/settings/password"].includes(url) ? "PUT" : "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+    let data = {}; try { data = await r.json(); } catch (e) {}
+    return { ok: r.ok, status: r.status, data };
+    } catch (e) { return { ok: false, status: 0, data: { error: "Connection failed. Check the device connection and try again." } }; }
+  }
+  $("s-clear-key").addEventListener("click", () => { clearKey = true; $("s-api-key").value = ""; $("s-api-key").placeholder = "will be cleared on save"; });
+  $("s-clear-token").addEventListener("click", () => { clearToken = true; $("s-token").value = ""; $("s-token").placeholder = "will be cleared on save"; });
+  $("settings-form").addEventListener("submit", async (ev) => {
+    ev.preventDefault();
+    const assignments = {};
+    for (const line of $("s-assign").value.split("\n")) {
+      const t = line.trim(); if (!t) continue;
+      const i = t.indexOf("="); if (i < 1) { setMsg("s-msg", `Assignment "${t}" must look like PORT=DRIVER.`, "bad"); return; }
+      assignments[t.slice(0, i).trim()] = t.slice(i + 1).trim();
+    }
+    const settings = {
+      forward_url: $("s-forward-url").value,
+      host: $("s-host").value,
+      cors_origins: $("s-cors").value.split(",").map(x => x.trim()).filter(Boolean),
+      fallback_driver: $("s-fallback").value,
+      assignments,
+      scale_quiet_ms: Number($("s-quiet").value) || undefined,
+      scale_min_weight_kg: $("s-minkg").value === "" ? undefined : Number($("s-minkg").value),
+    };
+    if ($("s-api-key").value) settings.forward_api_key = $("s-api-key").value; else if (clearKey) settings.forward_api_key = "";
+    if ($("s-token").value) settings.forward_token = $("s-token").value; else if (clearToken) settings.forward_token = "";
+    const password = $("s-password").value || undefined;
+    setMsg("s-msg", "Saving…");
+    const r = await settingsCall("/api/settings", { password, settings });
+    $("s-password").value = "";
+    if (r.ok) { showSettings(r.data); setMsg("s-msg", "Saved.", "ok"); }
+    else setMsg("s-msg", r.data.error || `HTTP ${r.status}`, r.status === 423 ? "warn" : "bad");
+  });
+  $("s-test").addEventListener("click", async () => {
+    setMsg("s-msg", "Testing…");
+    const r = await settingsCall("/api/settings/test", {});
+    setMsg("s-msg", `${r.data.message || ""}${r.data.status ? ` (HTTP ${r.data.status})` : ""}`, r.data.ok ? "ok" : "bad");
+  });
+  $("password-form").addEventListener("submit", async (ev) => {
+    ev.preventDefault();
+    const nw = $("pw-new").value, confirm = $("pw-confirm").value;
+    if (nw !== confirm) { setMsg("pw-msg", "New password and confirmation differ.", "bad"); return; }
+    setMsg("pw-msg", "Working…");
+    const r = await settingsCall("/api/settings/password", { current: $("pw-current").value || undefined, new: nw || undefined });
+    if (r.ok) {
+      $("pw-current").value = $("pw-new").value = $("pw-confirm").value = "";
+      showSettings(r.data);
+      setMsg("pw-msg", r.data.password_set ? "Password saved. Changes now require it." : "Password removed.", "ok");
+    }
+    else setMsg("pw-msg", r.data.error || `HTTP ${r.status}`, r.status === 423 ? "warn" : "bad");
+  });
+  loadSettings();
   connect();
+
+  async function pollForwarding() {
+    try {
+      const r = await fetch("/api/status", { cache: "no-store" });
+      if (r.ok) {
+        const status = await r.json(), f = status.forwarding;
+        if (f) $("forward-health").textContent = `EMR: ${f.storage_error || f.message}. Pending: ${f.pending}. Rejected: ${f.rejected}.`;
+      }
+    } catch (e) { $("forward-health").textContent = "Cannot check EMR delivery status."; }
+  }
+  pollForwarding();
+  setInterval(pollForwarding, 15000);
+
+  setInterval(() => { renderLive(); if (latest) renderLatest(); renderDevices(); }, 1000);
 })();
 </script>
 </body>

@@ -28,6 +28,16 @@ clap = { version = "4", features = ["derive", "env"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow = "1"
+# Production forwarding uses verified TLS. An exact HTTP origin can be
+# explicitly enabled locally for an encrypted private-network deployment.
+ureq = { version = "3", default-features = false, features = ["json"] }
+# Settings-page password. Argon2id, pure Rust, cross-compiles for the Pi.
+argon2 = { version = "0.5", features = ["std"] }
+
+[features]
+default = ["tls"]
+# HTTPS for the forwarder when the FHIR server is not reached over the tailnet.
+tls = ["ureq/rustls"]
 
 [profile.release]
 opt-level = "s"     # small binary for the Pi Zero; this program is I/O bound

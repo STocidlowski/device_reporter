@@ -24,6 +24,7 @@ pub struct AppState {
     history: RwLock<VecDeque<Observation>>,
     history_cap: usize,
     events: broadcast::Sender<Event>,
+    forwarding: RwLock<crate::model::ForwardStatus>,
 }
 
 fn read<T>(lock: &RwLock<T>) -> RwLockReadGuard<'_, T> {
@@ -47,6 +48,7 @@ impl AppState {
             history: RwLock::new(VecDeque::with_capacity(history_cap)),
             history_cap: history_cap.max(1),
             events,
+            forwarding: RwLock::new(crate::model::ForwardStatus::default()),
         }
     }
 
@@ -58,7 +60,25 @@ impl AppState {
             version: env!("CARGO_PKG_VERSION").to_owned(),
             started_at: self.started_at,
             devices: self.devices(),
+            forwarding: read(&self.forwarding).clone(),
         }
+    }
+
+    pub fn forward_status(&self, pending: usize, rejected: usize, message: &str) {
+        let mut status = write(&self.forwarding);
+        status.pending = pending;
+        status.rejected = rejected;
+        message.clone_into(&mut status.message);
+    }
+
+    pub fn forward_storage_error(&self, message: Option<&str>) {
+        write(&self.forwarding).storage_error = message.map(str::to_owned);
+    }
+
+    pub fn forward_counts(&self, pending: usize, rejected: usize) {
+        let mut status = write(&self.forwarding);
+        status.pending = pending;
+        status.rejected = rejected;
     }
 
     /// Every device seen since start, sorted by ID.
